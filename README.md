@@ -327,17 +327,28 @@ cp -R skills/bitrix24-agent ~/.moltbot/skills/bitrix24-agent
 
 Restart runtime or refresh skill cache.
 
-## User scenarios (short list)
+## User scenarios (20 examples)
 
-1. Create lead from external form.
-2. Enrich lead with external data.
-3. Auto-route lead by score.
-4. Create task on deal stage change.
-5. Write AI summary to CRM comments.
-6. Bulk update entities with guarded batch.
-7. Sync selected CRM fields to external DB.
-8. Detect stale deals and escalate.
-9. Recover missed updates with offline events.
+1. Create a lead from website form payload and attach source metadata.
+2. Enrich a lead with normalized phone/email and external profile signals.
+3. Convert high-score leads into prioritized follow-up tasks.
+4. Create a deal when a lead reaches qualification threshold.
+5. Update deal stage and push a notification to the responsible user.
+6. Add automatic task escalation when deal stays in stage too long.
+7. Build a daily list of deals without active tasks.
+8. Write AI-generated call summary into CRM entity comments.
+9. Create a meeting in Calendar with attendees and reminder settings.
+10. Add a checklist to a task and assign item owners.
+11. Create team chat for a campaign and post kickoff message.
+12. Send system notifications for SLA breaches or missed deadlines.
+13. Publish a News Feed post for release announcements.
+14. Create a workgroup/project and attach execution tasks.
+15. Start a business process for document approval (when template is configured).
+16. Attach contact to deal and keep contact links synchronized.
+17. Export selected CRM slices for BI/reporting pipeline.
+18. Run guarded bulk updates via `batch` for operational cleanup.
+19. Validate method availability/scopes before rollout using diagnostics pack.
+20. Recover missed event handling through offline events polling and replay.
 10. Trigger bizproc workflow from CRM event.
 11. Send notification to chat on task changes.
 12. Register bot command and return structured answer.
