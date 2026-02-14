@@ -25,6 +25,24 @@ skills/bitrix24-agent/
   scripts/offline_sync_worker.py
 ```
 
+## 15 Practical User Scenarios
+
+1. Auto-create a lead when a new website form submission arrives.
+2. Enrich new leads with external data before assignment.
+3. Route leads to the right owner based on custom business rules.
+4. Create follow-up tasks automatically after deal stage changes.
+5. Post AI-generated deal summaries as timeline comments.
+6. Sync selected CRM entities to an external data warehouse.
+7. Detect stale deals and trigger reminders or escalation tasks.
+8. Build a chatbot flow that answers and logs key actions in CRM.
+9. Mirror task updates to an external project management system.
+10. Validate required fields before permitting critical status transitions.
+11. Run nightly reconciliation to fix missed or delayed event updates.
+12. Trigger approval workflows when high-value deals are created.
+13. Aggregate activity signals and score lead/deal priority.
+14. Implement safe bulk updates with batching, retries, and audit logs.
+15. Build a resilient offline-event worker for no-loss synchronization.
+
 ## Requirements
 
 - Python 3.9+
