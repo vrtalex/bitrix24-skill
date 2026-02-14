@@ -112,6 +112,42 @@ skills/bitrix24-agent
 
 The runtime should load `SKILL.md` and use bundled `references/` and `scripts/`.
 
+## Connect to OpenClaw / Moltbot
+
+This skill is AgentSkills-compatible and works as a normal `SKILL.md` folder.
+
+### OpenClaw
+
+Option A (workspace-local):
+
+```bash
+mkdir -p ~/.openclaw/workspace/skills
+cp -R skills/bitrix24-agent ~/.openclaw/workspace/skills/bitrix24-agent
+```
+
+Option B (current project workspace):
+- keep this repo as your active workspace, where the skill already exists at:
+  `skills/bitrix24-agent`
+
+Then refresh skills (or restart OpenClaw session/gateway).
+
+### Moltbot
+
+Moltbot loads skills from:
+1. `<workspace>/skills` (highest priority)
+2. `~/.moltbot/skills`
+3. bundled skills
+
+Install globally for Moltbot:
+
+```bash
+mkdir -p ~/.moltbot/skills
+cp -R skills/bitrix24-agent ~/.moltbot/skills/bitrix24-agent
+```
+
+If the same skill name exists in multiple locations, workspace copy takes precedence.
+After install, refresh skills or restart Moltbot.
+
 ## License
 
 This project is released under The Unlicense (public domain style; unrestricted use/modification/distribution).
