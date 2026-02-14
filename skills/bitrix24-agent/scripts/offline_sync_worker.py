@@ -212,6 +212,26 @@ def clear_processed(
     client.call("event.offline.clear", params=params)
 
 
+def report_offline_error(
+    client: Bitrix24Client,
+    *,
+    process_id: str,
+    message_ids: List[str],
+) -> None:
+    if not message_ids:
+        return
+    try:
+        client.call(
+            "event.offline.error",
+            params={
+                "process_id": process_id,
+                "message_id": message_ids,
+            },
+        )
+    except BitrixAPIError as exc:
+        print(f"Warning: failed to report event.offline.error ({exc.code}): {exc}")
+
+
 def run_once(
     client: Bitrix24Client,
     *,
@@ -233,6 +253,7 @@ def run_once(
         return 0
 
     clear_ids: List[str] = []
+    error_ids: List[str] = []
     has_pending_failures = False
     for event_item in events:
         event_schema_error = validate_event_item_schema(event_item)
@@ -247,6 +268,7 @@ def run_once(
             )
             if msg_id:
                 clear_ids.append(msg_id)
+                error_ids.append(msg_id)
             else:
                 has_pending_failures = True
             continue
@@ -279,8 +301,12 @@ def run_once(
                 retry_budget.clear(dedup)
                 if msg_id:
                     clear_ids.append(msg_id)
+                    error_ids.append(msg_id)
             else:
                 has_pending_failures = True
+
+    if error_ids:
+        report_offline_error(client, process_id=process_id, message_ids=error_ids)
 
     # If there are no pending failures, clear whole process_id even when message IDs are absent.
     # If there are pending failures, clear only explicitly successful/DLQ'ed message IDs.

@@ -23,4 +23,5 @@ Scope: baseline CRM/tasks/events operations.
 | `event.offline.list` | read | https://github.com/bitrix24/b24restdocs/blob/main/api-reference/events/event-offline-list.md |
 | `event.offline.get` | read | https://github.com/bitrix24/b24restdocs/blob/main/api-reference/events/event-offline-get.md |
 | `event.offline.clear` | destructive | https://github.com/bitrix24/b24restdocs/blob/main/api-reference/events/event-offline-clear.md |
+| `event.offline.error` | write | https://github.com/bitrix24/b24restdocs/blob/main/api-reference/events/event-offline-error.md |
 | `batch` | mixed | https://github.com/bitrix24/b24restdocs/blob/main/settings/how-to-call-rest-api/batch.md |

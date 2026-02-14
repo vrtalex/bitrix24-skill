@@ -1,6 +1,7 @@
 import os
 import pathlib
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -18,8 +19,8 @@ class Bitrix24ClientTests(unittest.TestCase):
         self.assertEqual(b24.parse_pack_list(""), ["core"])
 
     def test_parse_pack_list_valid_and_unknown(self):
-        packs = b24.parse_pack_list("core,comms,commerce,core")
-        self.assertEqual(packs, ["core", "comms", "commerce"])
+        packs = b24.parse_pack_list("core,comms,commerce,diagnostics,core")
+        self.assertEqual(packs, ["core", "comms", "commerce", "diagnostics"])
         with self.assertRaises(ValueError):
             b24.parse_pack_list("unknown-pack")
 
@@ -103,6 +104,44 @@ class Bitrix24ClientTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             with self.assertRaises(ValueError):
                 b24.load_tenant_config_from_env()
+
+    def test_build_rate_limiter_from_env_off(self):
+        with mock.patch.dict(os.environ, {"B24_RATE_LIMITER": "off"}, clear=True):
+            limiter = b24.build_rate_limiter_from_env()
+        self.assertIsInstance(limiter, b24.NoopRateLimiter)
+
+    def test_plan_store_create_and_consume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            plan_store = b24.PlanStore(pathlib.Path(tmp) / "plans.json", ttl_sec=120)
+            plan = plan_store.create(
+                tenant="portal.example",
+                method="crm.lead.add",
+                params={"fields": {"TITLE": "x"}},
+                risk="write",
+                allowlisted=True,
+                packs=["core"],
+            )
+            consumed = plan_store.consume(plan["plan_id"], tenant="portal.example")
+            self.assertEqual(consumed["method"], "crm.lead.add")
+            with self.assertRaises(ValueError):
+                plan_store.consume(plan["plan_id"], tenant="portal.example")
+
+    def test_idempotency_store_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = b24.IdempotencyStore(pathlib.Path(tmp) / "idem.json", ttl_sec=120)
+            key = store.key_for(
+                tenant="portal.example",
+                method="crm.lead.add",
+                params={"fields": {"TITLE": "x"}},
+                explicit_key="abc-123",
+            )
+            self.assertIsNone(store.check_replay(key))
+            store.start(key)
+            self.assertIsNone(store.check_replay(key))
+            store.done(key, {"result": 42})
+            self.assertEqual(store.check_replay(key), {"result": 42})
+            store.clear(key)
+            self.assertIsNone(store.check_replay(key))
 
 
 if __name__ == "__main__":

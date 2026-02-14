@@ -30,6 +30,7 @@ Context budget:
 - `platform`: ai, entity storage, biconnector data layer
 - `sites`: landing/site/page operations
 - `compliance`: user consents and sign-b2e document tails
+- `diagnostics`: method availability, scopes, features, event catalog checks
 
 ## Runtime usage
 

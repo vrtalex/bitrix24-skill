@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import hashlib
 import hmac
 import json
 import os
@@ -31,6 +32,11 @@ import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
 
 # Maximum backoff delay in milliseconds to prevent overflow
 MAX_BACKOFF_MS = 30_000
@@ -121,6 +127,14 @@ PACK_METHOD_ALLOWLIST: Dict[str, Tuple[str, ...]] = {
         "userconsent.*",
         "sign.*",
     ),
+    "diagnostics": (
+        "method.get",
+        "methods",
+        "events",
+        "feature.get",
+        "scope",
+        "server.time",
+    ),
 }
 
 DEFAULT_PACKS: Tuple[str, ...] = ("core",)
@@ -179,6 +193,75 @@ def mask_secrets(text: str) -> str:
     for pattern in _SECRETS_PATTERNS:
         result = pattern.sub(lambda m: m.group(0).split(":")[0] + ':"***"' if ":" in m.group(0) else m.group(0).split("=")[0] + "=***", result)
     return result
+
+
+def parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _lock_handle(fh: Any) -> None:
+    if fcntl is None:
+        return
+    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock_handle(fh: Any) -> None:
+    if fcntl is None:
+        return
+    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def _read_json_state(path: pathlib.Path) -> Dict[str, Any]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as fh:
+        _lock_handle(fh)
+        try:
+            fh.seek(0)
+            raw = fh.read().strip()
+            if not raw:
+                return {}
+            state = json.loads(raw)
+            if not isinstance(state, dict):
+                return {}
+            return state
+        except Exception:
+            return {}
+        finally:
+            _unlock_handle(fh)
+
+
+def _mutate_json_state(path: pathlib.Path, mutator: Callable[[Dict[str, Any]], Tuple[Dict[str, Any], Any]]) -> Any:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+", encoding="utf-8") as fh:
+        _lock_handle(fh)
+        try:
+            fh.seek(0)
+            raw = fh.read().strip()
+            try:
+                state = json.loads(raw) if raw else {}
+            except Exception:
+                state = {}
+            if not isinstance(state, dict):
+                state = {}
+
+            new_state, result = mutator(state)
+            if not isinstance(new_state, dict):
+                new_state = {}
+
+            fh.seek(0)
+            fh.truncate(0)
+            fh.write(json.dumps(new_state, ensure_ascii=True, sort_keys=True))
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+            return result
+        finally:
+            _unlock_handle(fh)
 
 
 def secure_compare(a: Optional[str], b: Optional[str]) -> bool:
@@ -435,6 +518,275 @@ class NoopRateLimiter:
         return
 
 
+class FileRateLimiter:
+    """Cross-process file-backed token bucket limiter keyed by tenant domain."""
+
+    def __init__(
+        self,
+        state_file: pathlib.Path,
+        *,
+        rate_per_sec: float = 2.0,
+        burst: float = 10.0,
+        state_ttl_sec: int = 3600,
+    ) -> None:
+        self.state_file = state_file
+        self.rate_per_sec = max(rate_per_sec, 0.1)
+        self.burst = max(burst, 1.0)
+        self.state_ttl_sec = max(state_ttl_sec, 60)
+
+    def acquire(self, key: str) -> None:
+        while True:
+            wait_sec = self._reserve(key)
+            if wait_sec <= 0:
+                return
+            time.sleep(wait_sec)
+
+    def _reserve(self, key: str) -> float:
+        now = time.time()
+
+        def mutate(state: Dict[str, Any]) -> Tuple[Dict[str, Any], float]:
+            per_key = state.get(key, {})
+            last = float(per_key.get("last", now))
+            tokens = float(per_key.get("tokens", self.burst))
+
+            elapsed = max(0.0, now - last)
+            tokens = min(self.burst, tokens + elapsed * self.rate_per_sec)
+
+            wait = 0.0
+            if tokens >= 1.0:
+                tokens -= 1.0
+            else:
+                wait = (1.0 - tokens) / self.rate_per_sec
+
+            per_key["last"] = now
+            per_key["tokens"] = tokens
+            state[key] = per_key
+
+            stale_keys = []
+            for candidate, candidate_val in state.items():
+                if not isinstance(candidate_val, dict):
+                    stale_keys.append(candidate)
+                    continue
+                candidate_last = float(candidate_val.get("last", now))
+                if (now - candidate_last) > self.state_ttl_sec:
+                    stale_keys.append(candidate)
+            for stale in stale_keys:
+                state.pop(stale, None)
+
+            return state, wait
+
+        return float(_mutate_json_state(self.state_file, mutate))
+
+
+class PlanStore:
+    def __init__(self, state_file: pathlib.Path, ttl_sec: int = 1800) -> None:
+        self.state_file = state_file
+        self.ttl_sec = max(ttl_sec, 60)
+
+    def create(
+        self,
+        *,
+        tenant: str,
+        method: str,
+        params: Dict[str, Any],
+        risk: str,
+        allowlisted: bool,
+        packs: Sequence[str],
+    ) -> Dict[str, Any]:
+        now = int(time.time())
+        params_json = json.dumps(params, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        seed = f"{tenant}|{method}|{risk}|{params_json}|{now}|{uuid.uuid4().hex}"
+        plan_id = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:20]
+
+        plan = {
+            "plan_id": plan_id,
+            "tenant": tenant,
+            "method": method,
+            "params": params,
+            "risk": risk,
+            "allowlisted": bool(allowlisted),
+            "packs": list(packs),
+            "created_at": now,
+            "expires_at": now + self.ttl_sec,
+            "executed": False,
+        }
+
+        def mutate(state: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+            plans = state.get("plans")
+            if not isinstance(plans, dict):
+                plans = {}
+            plans = self._cleanup_plans(plans, now)
+            plans[plan_id] = plan
+            state["plans"] = plans
+            return state, plan
+
+        return dict(_mutate_json_state(self.state_file, mutate))
+
+    def consume(self, plan_id: str, *, tenant: str) -> Dict[str, Any]:
+        now = int(time.time())
+
+        def mutate(state: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+            plans = state.get("plans")
+            if not isinstance(plans, dict):
+                plans = {}
+            plans = self._cleanup_plans(plans, now)
+            plan = plans.get(plan_id)
+            if not isinstance(plan, dict):
+                raise ValueError(f"plan '{plan_id}' not found or expired")
+            if plan.get("tenant") != tenant:
+                raise ValueError("plan tenant mismatch")
+            if plan.get("executed"):
+                raise ValueError(f"plan '{plan_id}' already executed")
+            plan["executed"] = True
+            plan["executed_at"] = now
+            plans[plan_id] = plan
+            state["plans"] = plans
+            return state, plan
+
+        return dict(_mutate_json_state(self.state_file, mutate))
+
+    @staticmethod
+    def _cleanup_plans(plans: Dict[str, Any], now: int) -> Dict[str, Any]:
+        cleaned: Dict[str, Any] = {}
+        for pid, payload in plans.items():
+            if not isinstance(payload, dict):
+                continue
+            expires_at = int(payload.get("expires_at", 0))
+            if expires_at and expires_at < now:
+                continue
+            cleaned[pid] = payload
+        return cleaned
+
+
+class IdempotencyStore:
+    def __init__(self, state_file: pathlib.Path, ttl_sec: int = 86400) -> None:
+        self.state_file = state_file
+        self.ttl_sec = max(ttl_sec, 60)
+
+    def key_for(
+        self,
+        *,
+        tenant: str,
+        method: str,
+        params: Dict[str, Any],
+        explicit_key: Optional[str] = None,
+    ) -> str:
+        if explicit_key:
+            raw_key = explicit_key.strip()
+            if raw_key:
+                return f"{tenant}|{method}|{raw_key}"
+
+        for candidate in (
+            "idempotency_key",
+            "IDEMPOTENCY_KEY",
+            "origin_id",
+            "ORIGIN_ID",
+            "external_id",
+            "EXTERNAL_ID",
+        ):
+            value = params.get(candidate)
+            if isinstance(value, (str, int)):
+                return f"{tenant}|{method}|{candidate}:{value}"
+
+        payload = json.dumps(params, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(f"{tenant}|{method}|{payload}".encode("utf-8")).hexdigest()[:24]
+        return f"{tenant}|{method}|auto:{digest}"
+
+    def check_replay(self, key: str) -> Optional[Dict[str, Any]]:
+        state = _read_json_state(self.state_file)
+        now = int(time.time())
+        entries = state.get("entries")
+        if not isinstance(entries, dict):
+            return None
+        payload = entries.get(key)
+        if not isinstance(payload, dict):
+            return None
+        if int(payload.get("expires_at", 0)) < now:
+            return None
+        if payload.get("status") != "done":
+            return None
+        response = payload.get("response")
+        if isinstance(response, dict):
+            return response
+        return None
+
+    def start(self, key: str) -> None:
+        now = int(time.time())
+        expires_at = now + self.ttl_sec
+
+        def mutate(state: Dict[str, Any]) -> Tuple[Dict[str, Any], None]:
+            entries = state.get("entries")
+            if not isinstance(entries, dict):
+                entries = {}
+            entries = self._cleanup(entries, now)
+            entries[key] = {
+                "status": "in_progress",
+                "updated_at": now,
+                "expires_at": expires_at,
+            }
+            state["entries"] = entries
+            return state, None
+
+        _mutate_json_state(self.state_file, mutate)
+
+    def done(self, key: str, response: Dict[str, Any]) -> None:
+        now = int(time.time())
+        expires_at = now + self.ttl_sec
+
+        def mutate(state: Dict[str, Any]) -> Tuple[Dict[str, Any], None]:
+            entries = state.get("entries")
+            if not isinstance(entries, dict):
+                entries = {}
+            entries = self._cleanup(entries, now)
+            entries[key] = {
+                "status": "done",
+                "updated_at": now,
+                "expires_at": expires_at,
+                "response": response,
+            }
+            state["entries"] = entries
+            return state, None
+
+        _mutate_json_state(self.state_file, mutate)
+
+    def clear(self, key: str) -> None:
+        now = int(time.time())
+
+        def mutate(state: Dict[str, Any]) -> Tuple[Dict[str, Any], None]:
+            entries = state.get("entries")
+            if not isinstance(entries, dict):
+                entries = {}
+            entries = self._cleanup(entries, now)
+            entries.pop(key, None)
+            state["entries"] = entries
+            return state, None
+
+        _mutate_json_state(self.state_file, mutate)
+
+    @staticmethod
+    def _cleanup(entries: Dict[str, Any], now: int) -> Dict[str, Any]:
+        cleaned: Dict[str, Any] = {}
+        for key, payload in entries.items():
+            if not isinstance(payload, dict):
+                continue
+            expires_at = int(payload.get("expires_at", 0))
+            if expires_at and expires_at < now:
+                continue
+            cleaned[key] = payload
+        return cleaned
+
+
+def build_rate_limiter_from_env() -> Any:
+    mode = os.getenv("B24_RATE_LIMITER", "file").strip().lower()
+    if mode in {"", "off", "none", "noop"}:
+        return NoopRateLimiter()
+    state_file = pathlib.Path(os.getenv("B24_RATE_LIMITER_FILE", ".runtime/bitrix24_rate_limiter.json"))
+    rate = float(os.getenv("B24_RATE_LIMITER_RATE", "2.0"))
+    burst = float(os.getenv("B24_RATE_LIMITER_BURST", "10.0"))
+    ttl_sec = int(os.getenv("B24_RATE_LIMITER_TTL_SEC", "3600"))
+    return FileRateLimiter(state_file, rate_per_sec=rate, burst=burst, state_ttl_sec=ttl_sec)
+
+
 RefreshCallback = Callable[[TenantConfig, TokenStore], Tuple[str, Optional[str]]]
 
 
@@ -446,7 +798,7 @@ class Bitrix24Client:
         token_store: Optional[TokenStore] = None,
         timeout: int = 30,
         max_attempts: int = 5,
-        rate_limiter: Optional[NoopRateLimiter] = None,
+        rate_limiter: Optional[Any] = None,
         refresh_callback: Optional[RefreshCallback] = None,
     ) -> None:
         self.tenant = tenant
@@ -774,7 +1126,7 @@ def load_tenant_config_from_env() -> Tuple[TenantConfig, TokenStore]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Bitrix24 REST call helper")
-    parser.add_argument("method", help="Bitrix24 method, e.g. crm.lead.list")
+    parser.add_argument("method", nargs="?", help="Bitrix24 method, e.g. crm.lead.list")
     parser.add_argument(
         "--params",
         default="{}",
@@ -812,7 +1164,7 @@ def main() -> None:
         default=os.getenv("B24_PACKS", ",".join(DEFAULT_PACKS)),
         help=(
             "Comma-separated capability packs: "
-            "core,comms,automation,collab,content,boards,commerce,services,platform,sites,compliance. "
+            "core,comms,automation,collab,content,boards,commerce,services,platform,sites,compliance,diagnostics. "
             "Use 'none' to disable packs."
         ),
     )
@@ -825,6 +1177,33 @@ def main() -> None:
         "--allow-unlisted",
         action="store_true",
         help="Allow methods outside allowlist for this call",
+    )
+    parser.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="Create and persist execution plan, print plan payload, do not execute API call",
+    )
+    parser.add_argument(
+        "--execute-plan",
+        default="",
+        help="Execute previously created plan id from plan store",
+    )
+    parser.add_argument(
+        "--plan-file",
+        default=os.getenv("B24_PLAN_FILE", ".runtime/bitrix24_plans.json"),
+        help="Path to persisted plan store JSON (default: B24_PLAN_FILE or .runtime/bitrix24_plans.json)",
+    )
+    parser.add_argument(
+        "--plan-ttl-sec",
+        type=int,
+        default=int(os.getenv("B24_PLAN_TTL_SEC", "1800")),
+        help="Plan expiration time in seconds (default: B24_PLAN_TTL_SEC or 1800)",
+    )
+    parser.add_argument(
+        "--require-plan",
+        action="store_true",
+        default=parse_bool_env("B24_REQUIRE_PLAN", default=False),
+        help="Require plan->execute for write/destructive operations (default from B24_REQUIRE_PLAN)",
     )
     parser.add_argument(
         "--confirm-write",
@@ -846,6 +1225,27 @@ def main() -> None:
         action="store_true",
         help="Disable audit logging for this call",
     )
+    parser.add_argument(
+        "--idempotency-key",
+        default="",
+        help="Explicit idempotency key for write/destructive operations",
+    )
+    parser.add_argument(
+        "--idempotency-file",
+        default=os.getenv("B24_IDEMPOTENCY_FILE", ".runtime/bitrix24_idempotency.json"),
+        help="Path to idempotency store JSON (default: B24_IDEMPOTENCY_FILE or .runtime/bitrix24_idempotency.json)",
+    )
+    parser.add_argument(
+        "--idempotency-ttl-sec",
+        type=int,
+        default=int(os.getenv("B24_IDEMPOTENCY_TTL_SEC", "86400")),
+        help="TTL for idempotency records in seconds (default: B24_IDEMPOTENCY_TTL_SEC or 86400)",
+    )
+    parser.add_argument(
+        "--no-idempotency",
+        action="store_true",
+        help="Disable idempotency layer for write/destructive operations",
+    )
     args = parser.parse_args()
 
     try:
@@ -858,8 +1258,41 @@ def main() -> None:
         print("Error: --params must decode to a JSON object", file=sys.stderr)
         raise SystemExit(1)
 
+    tenant, token_store = load_tenant_config_from_env()
+    method = (args.method or "").strip().lower()
+
+    if args.execute_plan:
+        plan_store = PlanStore(pathlib.Path(args.plan_file), ttl_sec=args.plan_ttl_sec)
+        try:
+            plan = plan_store.consume(args.execute_plan.strip(), tenant=tenant.domain)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            raise SystemExit(2)
+
+        planned_method = str(plan.get("method", "")).strip().lower()
+        planned_params = plan.get("params", {})
+        if not isinstance(planned_params, dict):
+            print("Error: stored plan payload is invalid", file=sys.stderr)
+            raise SystemExit(2)
+        if method and method != planned_method:
+            print(
+                f"Error: CLI method '{method}' does not match planned method '{planned_method}'",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        method = planned_method
+        params = planned_params
+
+    if args.list_packs and not method:
+        # list-packs can work without method
+        pass
+    elif not method:
+        print("Error: method is required (or use --execute-plan)", file=sys.stderr)
+        raise SystemExit(2)
+
     try:
-        validate_method_and_params(args.method, params)
+        if method:
+            validate_method_and_params(method, params)
     except ValueError as exc:
         print(f"Error: Schema validation failed: {exc}", file=sys.stderr)
         raise SystemExit(2)
@@ -886,16 +1319,16 @@ def main() -> None:
         raise SystemExit(0)
 
     allowlist_patterns = expand_allowlist_with_packs(allowlist_patterns, selected_packs)
-    method_allowed = is_method_allowed(args.method, allowlist_patterns)
+    method_allowed = is_method_allowed(method, allowlist_patterns)
     if not method_allowed and not args.allow_unlisted:
         print(
-            f"Error: method '{args.method}' is outside allowlist. "
+            f"Error: method '{method}' is outside allowlist. "
             "Use --allow-unlisted to bypass or extend --method-allowlist/--packs.",
             file=sys.stderr,
         )
         raise SystemExit(2)
 
-    if args.method == "batch":
+    if method == "batch":
         batch_cmd = params.get("cmd", {})
         if isinstance(batch_cmd, dict):
             for name, command in batch_cmd.items():
@@ -910,7 +1343,35 @@ def main() -> None:
                     )
                     raise SystemExit(2)
 
-    method_risk = classify_method_risk(args.method, params=params)
+    method_risk = classify_method_risk(method, params=params)
+
+    if args.plan_only:
+        plan_store = PlanStore(pathlib.Path(args.plan_file), ttl_sec=args.plan_ttl_sec)
+        plan = plan_store.create(
+            tenant=tenant.domain,
+            method=method,
+            params=params,
+            risk=method_risk,
+            allowlisted=method_allowed,
+            packs=selected_packs,
+        )
+        plan_result = {
+            "plan": plan,
+            "next": {
+                "execute_command": f"python3 skills/bitrix24-agent/scripts/bitrix24_client.py --execute-plan {plan['plan_id']}"
+            },
+        }
+        print(json.dumps(plan_result, ensure_ascii=False, indent=2))
+        raise SystemExit(0)
+
+    if args.require_plan and method_risk in {"write", "destructive"} and not args.execute_plan:
+        print(
+            "Error: plan is required for write/destructive operation. "
+            "Run with --plan-only, then execute with --execute-plan <plan_id>.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
     if method_risk == "write" and not args.confirm_write:
         print(
             "Error: write method detected. Add --confirm-write to execute.",
@@ -924,23 +1385,72 @@ def main() -> None:
         )
         raise SystemExit(2)
 
-    tenant, token_store = load_tenant_config_from_env()
     refresh_callback = refresh_via_oauth_server if args.auto_refresh else None
-    client = Bitrix24Client(tenant, token_store=token_store, refresh_callback=refresh_callback)
+    client = Bitrix24Client(
+        tenant,
+        token_store=token_store,
+        refresh_callback=refresh_callback,
+        rate_limiter=build_rate_limiter_from_env(),
+    )
     request_id = uuid.uuid4().hex[:12]
     started = time.time()
     audit_file = None if args.no_audit else get_audit_file_path(args.audit_file)
+    idempotency_enabled = method_risk in {"write", "destructive"} and not args.no_idempotency
+    idempotency_store = None
+    idempotency_key = ""
+    replayed = False
+
+    if idempotency_enabled:
+        idempotency_store = IdempotencyStore(
+            pathlib.Path(args.idempotency_file),
+            ttl_sec=args.idempotency_ttl_sec,
+        )
+        idempotency_key = idempotency_store.key_for(
+            tenant=tenant.domain,
+            method=method,
+            params=params,
+            explicit_key=args.idempotency_key,
+        )
+        cached = idempotency_store.check_replay(idempotency_key)
+        if isinstance(cached, dict):
+            replayed = True
+            write_audit_row(
+                audit_file,
+                {
+                    "ts": int(time.time()),
+                    "request_id": request_id,
+                    "tenant": tenant.domain,
+                    "method": method,
+                    "risk": method_risk,
+                    "status": "idempotent_replay",
+                    "duration_ms": int((time.time() - started) * 1000),
+                    "allowlisted": method_allowed,
+                    "packs": selected_packs,
+                    "rest_v3": args.rest_v3,
+                    "param_keys": sorted(params.keys()),
+                    "plan_id": args.execute_plan or "",
+                    "idempotency_key": idempotency_key,
+                },
+            )
+            output = json.dumps(cached, ensure_ascii=False, indent=2)
+            if args.mask_secrets:
+                output = mask_secrets(output)
+            print(output)
+            raise SystemExit(0)
+        idempotency_store.start(idempotency_key)
 
     try:
-        response = client.call(args.method, params=params, rest_v3=args.rest_v3)
+        response = client.call(method, params=params, rest_v3=args.rest_v3)
     except BitrixAPIError as exc:
+        if idempotency_store and idempotency_key:
+            idempotency_store.clear(idempotency_key)
         write_audit_row(
             audit_file,
             {
                 "ts": int(time.time()),
                 "request_id": request_id,
                 "tenant": tenant.domain,
-                "method": args.method,
+                "method": method,
                 "risk": method_risk,
                 "status": "error",
                 "error_code": exc.code,
@@ -950,10 +1460,16 @@ def main() -> None:
                 "packs": selected_packs,
                 "rest_v3": args.rest_v3,
                 "param_keys": sorted(params.keys()),
+                "plan_id": args.execute_plan or "",
+                "idempotency_key": idempotency_key,
+                "idempotent_replay": replayed,
             },
         )
         print(f"Bitrix API error: code={exc.code} status={exc.status} msg={exc}", file=sys.stderr)
         raise SystemExit(1)
+
+    if idempotency_store and idempotency_key:
+        idempotency_store.done(idempotency_key, response)
 
     write_audit_row(
         audit_file,
@@ -961,7 +1477,7 @@ def main() -> None:
             "ts": int(time.time()),
             "request_id": request_id,
             "tenant": tenant.domain,
-            "method": args.method,
+            "method": method,
             "risk": method_risk,
             "status": "ok",
             "duration_ms": int((time.time() - started) * 1000),
@@ -969,6 +1485,9 @@ def main() -> None:
             "packs": selected_packs,
             "rest_v3": args.rest_v3,
             "param_keys": sorted(params.keys()),
+            "plan_id": args.execute_plan or "",
+            "idempotency_key": idempotency_key,
+            "idempotent_replay": replayed,
         },
     )
 

@@ -25,6 +25,8 @@ class FakeClient:
             return self.offline_response
         if method == "event.offline.clear":
             return {"result": True}
+        if method == "event.offline.error":
+            return {"result": True}
         raise AssertionError(f"Unexpected method: {method}")
 
 
@@ -107,6 +109,9 @@ class OfflineWorkerTests(unittest.TestCase):
         clear_calls = [c for c in client.calls if c[0] == "event.offline.clear"]
         self.assertEqual(len(clear_calls), 1)
         self.assertEqual(clear_calls[0][1]["message_id"], ["9"])
+        error_calls = [c for c in client.calls if c[0] == "event.offline.error"]
+        self.assertEqual(len(error_calls), 1)
+        self.assertEqual(error_calls[0][1]["message_id"], ["9"])
 
     def test_run_once_retry_then_dlq_on_exhaust(self):
         response = {
@@ -130,6 +135,9 @@ class OfflineWorkerTests(unittest.TestCase):
         clear_calls = [c for c in client.calls if c[0] == "event.offline.clear"]
         self.assertEqual(len(clear_calls), 1)
         self.assertEqual(clear_calls[0][1]["message_id"], ["1"])
+        error_calls = [c for c in client.calls if c[0] == "event.offline.error"]
+        self.assertEqual(len(error_calls), 1)
+        self.assertEqual(error_calls[0][1]["message_id"], ["1"])
 
     def test_run_once_invalid_application_token_does_not_clear(self):
         response = {

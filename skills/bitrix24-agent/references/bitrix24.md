@@ -259,6 +259,7 @@ Keep runtime policy thin and expand by packs:
 - `platform`
 - `sites`
 - `compliance`
+- `diagnostics`
 
 Companion docs in this skill:
 - `references/packs.md`
@@ -273,6 +274,7 @@ Companion docs in this skill:
 - `references/catalog-platform.md`
 - `references/catalog-sites.md`
 - `references/catalog-compliance.md`
+- `references/catalog-diagnostics.md`
 - `references/chains-core.md`
 - `references/chains-comms.md`
 - `references/chains-automation.md`
@@ -284,6 +286,7 @@ Companion docs in this skill:
 - `references/chains-platform.md`
 - `references/chains-sites.md`
 - `references/chains-compliance.md`
+- `references/chains-diagnostics.md`
 
 ## 7. `batch` Without Shooting Yourself in the Foot
 

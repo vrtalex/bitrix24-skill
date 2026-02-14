@@ -49,7 +49,7 @@ Term normalization (product vocabulary):
 
 3. Select minimal packs:
 - default `core`.
-- add only required packs: `comms`, `automation`, `collab`, `content`, `boards`, `commerce`, `services`, `platform`, `sites`, `compliance`.
+- add only required packs: `comms`, `automation`, `collab`, `content`, `boards`, `commerce`, `services`, `platform`, `sites`, `compliance`, `diagnostics`.
 
 4. Execute with guardrails:
 - prefer `scripts/bitrix24_client.py` and `scripts/offline_sync_worker.py`,

@@ -84,6 +84,7 @@ Each pack is a small method set + short recipes.
 | `platform` | AI, entity storage, biconnector |
 | `sites` | Landing/site/page management |
 | `compliance` | User consent and sign-b2e document tails |
+| `diagnostics` | Method/scope/feature/events compatibility checks |
 
 Pack docs:
 - Index: `skills/bitrix24-agent/references/packs.md`
@@ -105,6 +106,7 @@ Pack docs:
 | AI engines/entity/biconnector | `platform` |
 | Landing/site/page management | `sites` |
 | Consent and sign-b2e tails | `compliance` |
+| Method/scope/events diagnostics | `diagnostics` |
 
 ## Token-efficient usage with agents
 
@@ -133,6 +135,44 @@ python3 skills/bitrix24-agent/scripts/bitrix24_client.py <method> \
 - add/update a recipe in `skills/bitrix24-agent/references/chains-<pack>.md`
 - extend allowlist patterns in `skills/bitrix24-agent/scripts/bitrix24_client.py` (`PACK_METHOD_ALLOWLIST`)
 4. Re-run smoke checks and commit.
+
+## Safer execution mode (recommended)
+
+Two-phase write flow:
+
+```bash
+python3 skills/bitrix24-agent/scripts/bitrix24_client.py crm.lead.add \
+  --params '{"fields":{"TITLE":"Plan demo"}}' \
+  --packs core \
+  --plan-only
+
+python3 skills/bitrix24-agent/scripts/bitrix24_client.py \
+  --execute-plan <plan_id_from_previous_output> \
+  --confirm-write
+```
+
+Strictly require plan for write/destructive calls:
+
+```bash
+export B24_REQUIRE_PLAN="1"
+```
+
+Idempotent write replay protection:
+
+```bash
+python3 skills/bitrix24-agent/scripts/bitrix24_client.py crm.lead.add \
+  --params '{"fields":{"TITLE":"Idempotent lead"}}' \
+  --confirm-write \
+  --idempotency-key "lead-source-123"
+```
+
+Shared portal limiter (file-backed, default):
+
+```bash
+export B24_RATE_LIMITER="file"
+export B24_RATE_LIMITER_RATE="2.0"
+export B24_RATE_LIMITER_BURST="10"
+```
 
 ## Quick start
 
@@ -203,6 +243,14 @@ Disable packs and rely only on explicit allowlist:
 python3 skills/bitrix24-agent/scripts/bitrix24_client.py user.current --params '{}' --packs none --method-allowlist 'user.*'
 ```
 
+Diagnostics pack example:
+
+```bash
+python3 skills/bitrix24-agent/scripts/bitrix24_client.py method.get \
+  --params '{"name":"crm.lead.add"}' \
+  --packs core,diagnostics
+```
+
 ## Practical API examples
 
 Create lead:
@@ -237,6 +285,22 @@ Offline events worker:
 
 ```bash
 python3 skills/bitrix24-agent/scripts/offline_sync_worker.py --once
+```
+
+## Integration smoke tests
+
+Run env-gated live tests against your test portal:
+
+```bash
+export B24_RUN_INTEGRATION="1"
+python3 -m unittest tests.test_integration_smoke -v
+```
+
+Enable write smoke flow (`crm.lead.add` + `crm.lead.update`):
+
+```bash
+export B24_SMOKE_WRITE="1"
+python3 -m unittest tests.test_integration_smoke -v
 ```
 
 ## OpenClaw / Moltbot
