@@ -7,6 +7,13 @@ Production-ready skill package for building and hardening AI integrations with B
 - event pipelines (online/offline),
 - operational guardrails (idempotency, DLQ, policy gates).
 
+## What This Repo Includes
+
+- `skills/bitrix24-agent/SKILL.md`: core workflow and guardrails.
+- `skills/bitrix24-agent/references/bitrix24.md`: detailed implementation playbook.
+- `skills/bitrix24-agent/scripts/bitrix24_client.py`: CLI client for REST calls.
+- `skills/bitrix24-agent/scripts/offline_sync_worker.py`: offline event queue worker.
+
 ## Repository Structure
 
 ```text
@@ -18,7 +25,13 @@ skills/bitrix24-agent/
   scripts/offline_sync_worker.py
 ```
 
-## Quick Start
+## Requirements
+
+- Python 3.9+
+- Bitrix24 portal with REST access
+- Either webhook credentials or OAuth app credentials
+
+## Quick Start (Webhook)
 
 1. Create local env file:
 
@@ -38,15 +51,67 @@ set +a
 python3 skills/bitrix24-agent/scripts/bitrix24_client.py user.current --params '{}'
 ```
 
-4. CRM test:
+4. CRM write test:
 
 ```bash
 python3 skills/bitrix24-agent/scripts/bitrix24_client.py crm.lead.add \
   --params '{"fields":{"TITLE":"SKILL_TEST Lead","NAME":"Bot"}}'
 ```
 
-## Important Notes
+## Quick Start (OAuth)
+
+Set env values:
+- `B24_AUTH_MODE=oauth`
+- `B24_ACCESS_TOKEN`
+- `B24_REFRESH_TOKEN` (optional but recommended)
+- `B24_CLIENT_ID` and `B24_CLIENT_SECRET` (required for auto-refresh)
+
+Then:
+
+```bash
+set -a
+source .env
+set +a
+
+python3 skills/bitrix24-agent/scripts/bitrix24_client.py user.current --params '{}' --auto-refresh
+```
+
+## Event/Queue Tests
+
+`events` and `event.offline.*` require app/OAuth context.
+
+```bash
+python3 skills/bitrix24-agent/scripts/bitrix24_client.py events --params '{"FULL": true}'
+python3 skills/bitrix24-agent/scripts/offline_sync_worker.py --once
+```
+
+## Common Errors
+
+- `Method not found` in webhook mode:
+  usually wrong webhook path parts (check user id and secret formatting).
+- `WRONG_AUTH_TYPE`:
+  method requires app/OAuth context, webhook auth is not enough.
+- `QUERY_LIMIT_EXCEEDED`:
+  request rate is too high; use retries/backoff and lower concurrency.
+- `insufficient_scope` / `INVALID_CREDENTIALS`:
+  missing scope or insufficient user permissions in Bitrix24.
+
+## Security Notes
 
 - Keep `B24_WEBHOOK_CODE` as secret only, without `user_id/` prefix.
-- Methods like `events` and `event.offline.*` require app/OAuth context (not plain webhook auth).
 - Never commit real secrets from `.env` (this repo ignores `.env` by default).
+- Do not place webhook or OAuth secrets in frontend code.
+
+## Using the Skill in Agent Runtimes
+
+This repository ships an Agent Skill folder. Point your runtime to:
+
+```text
+skills/bitrix24-agent
+```
+
+The runtime should load `SKILL.md` and use bundled `references/` and `scripts/`.
+
+## License
+
+This project is released under The Unlicense (public domain style; unrestricted use/modification/distribution).
