@@ -55,17 +55,52 @@ FATAL_ERROR_CODES: Set[str] = frozenset({
 })
 
 DEFAULT_METHOD_ALLOWLIST: Tuple[str, ...] = (
+    # Base allowlist is intentionally narrow; packs expand it.
     "batch",
-    "user.*",
-    "department.*",
-    "crm.*",
-    "tasks.*",
-    "task.*",
-    "event.*",
-    "imbot.*",
-    "im.*",
-    "ai.*",
 )
+
+PACK_METHOD_ALLOWLIST: Dict[str, Tuple[str, ...]] = {
+    "core": (
+        "batch",
+        "user.*",
+        "department.*",
+        "crm.*",
+        "tasks.task.*",
+        "task.*",
+        "event.*",
+    ),
+    "comms": (
+        "im.*",
+        "imbot.*",
+        "imopenlines.*",
+        "messageservice.*",
+        "telephony.*",
+    ),
+    "automation": (
+        "bizproc.*",
+        "crm.automation.*",
+        "lists.*",
+    ),
+    "collab": (
+        "sonet_group.*",
+        "socialnetwork.*",
+        "log.*",
+        "calendar.*",
+        "vote.*",
+    ),
+    "content": (
+        "disk.*",
+        "file.*",
+        "files.*",
+        "documentgenerator.*",
+    ),
+    "boards": (
+        "tasks.api.scrum.*",
+        "tasks.scrum.*",
+    ),
+}
+
+DEFAULT_PACKS: Tuple[str, ...] = ("core",)
 
 METHOD_NAME_SCHEMA: Dict[str, Any] = {
     "type": "string",
@@ -218,6 +253,46 @@ def parse_method_allowlist(raw: Optional[str]) -> List[str]:
         return list(DEFAULT_METHOD_ALLOWLIST)
     patterns = [pattern.strip().lower() for pattern in raw.split(",") if pattern.strip()]
     return patterns or list(DEFAULT_METHOD_ALLOWLIST)
+
+
+def parse_pack_list(raw: Optional[str]) -> List[str]:
+    if raw is None or not raw.strip():
+        return list(DEFAULT_PACKS)
+    pack_names = [name.strip().lower() for name in raw.split(",") if name.strip()]
+    if pack_names == ["none"]:
+        return []
+
+    deduped: List[str] = []
+    seen: Set[str] = set()
+    for name in pack_names:
+        if name not in PACK_METHOD_ALLOWLIST:
+            available = ", ".join(sorted(PACK_METHOD_ALLOWLIST.keys()))
+            raise ValueError(f"unknown pack '{name}', available packs: {available}")
+        if name in seen:
+            continue
+        seen.add(name)
+        deduped.append(name)
+    return deduped
+
+
+def expand_allowlist_with_packs(base_patterns: Sequence[str], packs: Sequence[str]) -> List[str]:
+    merged: List[str] = []
+    seen: Set[str] = set()
+    for pattern in list(base_patterns):
+        key = pattern.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(key)
+
+    for pack in packs:
+        for pattern in PACK_METHOD_ALLOWLIST[pack]:
+            key = pattern.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(key)
+    return merged
 
 
 def is_method_allowed(method: str, patterns: Sequence[str]) -> bool:
@@ -710,6 +785,16 @@ def main() -> None:
         help="Comma-separated method allowlist patterns, e.g. 'user.*,crm.*,batch'",
     )
     parser.add_argument(
+        "--packs",
+        default=os.getenv("B24_PACKS", ",".join(DEFAULT_PACKS)),
+        help="Comma-separated capability packs: core,comms,automation,collab,content,boards. Use 'none' to disable packs.",
+    )
+    parser.add_argument(
+        "--list-packs",
+        action="store_true",
+        help="Print available packs and exit.",
+    )
+    parser.add_argument(
         "--allow-unlisted",
         action="store_true",
         help="Allow methods outside allowlist for this call",
@@ -753,11 +838,32 @@ def main() -> None:
         raise SystemExit(2)
 
     allowlist_patterns = parse_method_allowlist(args.method_allowlist)
+    try:
+        selected_packs = parse_pack_list(args.packs)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        raise SystemExit(2)
+
+    if args.list_packs:
+        print(
+            json.dumps(
+                {
+                    "default_packs": list(DEFAULT_PACKS),
+                    "available_packs": PACK_METHOD_ALLOWLIST,
+                    "selected_packs": selected_packs,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        raise SystemExit(0)
+
+    allowlist_patterns = expand_allowlist_with_packs(allowlist_patterns, selected_packs)
     method_allowed = is_method_allowed(args.method, allowlist_patterns)
     if not method_allowed and not args.allow_unlisted:
         print(
             f"Error: method '{args.method}' is outside allowlist. "
-            "Use --allow-unlisted to bypass or extend --method-allowlist.",
+            "Use --allow-unlisted to bypass or extend --method-allowlist/--packs.",
             file=sys.stderr,
         )
         raise SystemExit(2)
@@ -814,6 +920,7 @@ def main() -> None:
                 "error_message": str(exc),
                 "duration_ms": int((time.time() - started) * 1000),
                 "allowlisted": method_allowed,
+                "packs": selected_packs,
                 "rest_v3": args.rest_v3,
                 "param_keys": sorted(params.keys()),
             },
@@ -832,6 +939,7 @@ def main() -> None:
             "status": "ok",
             "duration_ms": int((time.time() - started) * 1000),
             "allowlisted": method_allowed,
+            "packs": selected_packs,
             "rest_v3": args.rest_v3,
             "param_keys": sorted(params.keys()),
         },

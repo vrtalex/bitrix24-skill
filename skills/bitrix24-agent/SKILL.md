@@ -34,6 +34,7 @@ Use it to avoid common failures: wrong auth model, missing scopes, non-idempoten
 5. Implement guarded write path:
 - Read-before-write for critical updates.
 - Apply method allowlist policy before every call.
+- Use capability packs (`core`, `comms`, `automation`, `collab`, `content`, `boards`) to keep allowlist minimal.
 - Idempotency strategy in your app layer.
 - Add optimistic concurrency checks to avoid blind overwrite.
 - Explicit confirmation for destructive operations.
@@ -70,6 +71,7 @@ Read `references/bitrix24.md` before implementation. It includes:
 - security checklist,
 - ready-to-use request templates.
 - ready-to-run Python utilities in `scripts/`.
+- pack index and modular method catalogs/chains in `references/packs.md`, `references/catalog-*.md`, `references/chains-*.md`.
 
 Quick section navigation:
 
@@ -78,6 +80,7 @@ rg -n "^## " references/bitrix24.md
 rg -n "QUERY_LIMIT_EXCEEDED|insufficient_scope|expired_token" references/bitrix24.md
 rg -n "offline|event\\.bind|event\\.offline" references/bitrix24.md
 rg -n "allowlist|DLQ|singleflight|pagination|contract tests" references/bitrix24.md
+rg -n "^# Catalog|^# Chains" references/catalog-*.md references/chains-*.md
 ```
 
 ## Scripts

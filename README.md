@@ -1,80 +1,105 @@
 # Bitrix24 Agent Skill Pack
 
-Production-grade skill pack to connect AI agents with Bitrix24 REST API quickly and safely.
+Compact, production-oriented skill pack for connecting AI agents to Bitrix24 REST.
 
-## Why Teams Choose This Skill
+## Why this pack
 
-- Fast launch: webhook mode for immediate automation.
-- Scale path: OAuth mode for durable multi-tenant integrations.
-- Reliability first: retry/backoff and offline queue worker pattern.
-- Agent-ready: clear `SKILL.md` + reference playbook for deterministic behavior.
-- Minimal footprint: no heavy framework dependency.
+- Fast start for real API calls.
+- Safe-by-default execution with allowlist, risk confirmations, and audit log.
+- Modular capability packs instead of one oversized monolith.
+- Works with webhook and OAuth flows.
 
-## Source Of Truth
+## Official docs source
 
-Official Bitrix24 REST documentation repository:
-- https://github.com/bitrix-tools/b24-rest-docs
+- Main documentation repo: https://github.com/bitrix24/b24restdocs
+- MCP docs: https://github.com/bitrix24/b24restdocs/blob/main/sdk/mcp.md
 
-Use it as the canonical source for methods, auth rules, events, and limits.
-
-## What Is Included
+## Project layout
 
 ```text
 skills/bitrix24-agent/
   SKILL.md
-  references/bitrix24.md
-  scripts/bitrix24_client.py
-  scripts/offline_sync_worker.py
+  references/
+    bitrix24.md
+    packs.md
+    catalog-*.md
+    chains-*.md
+  scripts/
+    bitrix24_client.py
+    offline_sync_worker.py
   agents/openai.yaml
 ```
 
-## Quality Guardrails Included
+## Auth model: when to use what
 
-- Input schema validation for method names and params.
-- Method allowlist with optional override.
-- Risk-based confirmation gates:
-  - `--confirm-write` for write operations,
-  - `--confirm-destructive` for delete/remove/unbind class operations.
-- JSONL audit trail for every CLI call (enabled by default).
-
-## Integration Choice: When To Use What
-
-| Option | Use it when | Avoid it when |
+| Option | Use when | Not ideal when |
 |---|---|---|
-| Incoming Webhook | You need fast setup for one portal and internal automation | You need marketplace/local app lifecycle, multi-tenant auth, or app-only event flows |
-| OAuth 2.0 App | You need scalable production integration, token lifecycle, app context methods, advanced event scenarios | You only need a quick single-portal script and want minimal setup |
-| Outgoing Webhook | You need near real-time push notifications from Bitrix24 to your endpoint | You require guaranteed delivery/replay by default |
-| MCP Server | You want agents to generate more accurate Bitrix24 API calls and discover methods/params faster | You treat MCP as runtime transport for production business operations |
+| Incoming webhook | One portal, quick internal automation | Multi-tenant app model, app-context-only methods |
+| OAuth app | Multi-portal scaling, app lifecycle, controlled token rotation | Very small one-portal scripts where setup speed matters most |
+| Outgoing webhook | Need push trigger from portal events to your handler | You need guaranteed retry/replay out of the box |
+| MCP server | Need better method/field discovery for agent generation quality | You treat MCP as transactional runtime for business writes |
 
 Short rule:
-- Runtime business actions: `incoming webhook` or `OAuth`.
-- Production multi-tenant/event-heavy architecture: `OAuth`.
-- Triggering from portal changes: `outgoing webhook` (plus your queue).
-- Agent implementation quality boost: `MCP`.
+- Runtime writes: webhook or OAuth.
+- Cross-portal product: OAuth.
+- Event trigger entrypoint: outgoing webhook + your queue.
+- Better agent method accuracy: MCP.
 
-## Requirements
+## Capability packs (recommended model)
 
-- Python 3.9+
-- Bitrix24 portal with REST access
-- Credentials for one auth mode
+Instead of one giant allowlist, this repo uses packs.
+Each pack is a small method set + short recipes.
 
-## Quick Start
+| Pack | Focus |
+|---|---|
+| `core` | CRM + tasks.task + user + events + batch |
+| `comms` | Chats, chat-bots, messaging, telephony |
+| `automation` | Bizproc/robots/templates |
+| `collab` | Workgroups/socialnetwork/feed-style collaboration |
+| `content` | Disk/files/document flows |
+| `boards` | Scrum/board methods |
 
-1. Create env file:
+Pack docs:
+- Index: `skills/bitrix24-agent/references/packs.md`
+- Catalogs: `skills/bitrix24-agent/references/catalog-*.md`
+- Chains: `skills/bitrix24-agent/references/chains-*.md`
+
+## If the skill does not cover a Bitrix24 function
+
+1. Verify method in official docs (`bitrix24/b24restdocs`) and required scope.
+2. Run it once in controlled mode:
+
+```bash
+python3 skills/bitrix24-agent/scripts/bitrix24_client.py <method> \
+  --params '<json>' \
+  --allow-unlisted \
+  --confirm-write
+```
+
+3. If it is stable and useful, add it to the right pack:
+- update `skills/bitrix24-agent/references/catalog-<pack>.md`
+- add/update a recipe in `skills/bitrix24-agent/references/chains-<pack>.md`
+- extend allowlist patterns in `skills/bitrix24-agent/scripts/bitrix24_client.py` (`PACK_METHOD_ALLOWLIST`)
+4. Re-run smoke checks and commit.
+
+## Quick start
+
+1. Create env:
 
 ```bash
 cp .env.example .env
+source .env
 ```
 
 2. Fill `.env`.
 
-Incoming webhook example:
+Webhook example:
 
 ```bash
 export B24_DOMAIN="your-portal.example"
 export B24_AUTH_MODE="webhook"
 export B24_WEBHOOK_USER_ID="1"
-export B24_WEBHOOK_CODE="your_webhook_code"
+export B24_WEBHOOK_CODE="your_webhook_secret_without_user_id_prefix"
 ```
 
 OAuth example:
@@ -88,17 +113,47 @@ export B24_CLIENT_ID="your_client_id"
 export B24_CLIENT_SECRET="your_client_secret"
 ```
 
-3. Load env and run smoke tests:
+3. Smoke tests:
 
 ```bash
-source .env
 python3 skills/bitrix24-agent/scripts/bitrix24_client.py user.current --params '{}'
 python3 skills/bitrix24-agent/scripts/bitrix24_client.py crm.lead.list --params '{"select":["ID","TITLE"],"start":0}'
 ```
 
-## Practical API Examples
+## Pack-enabled CLI usage
 
-Create a lead:
+Default active pack: `core`.
+
+List packs:
+
+```bash
+python3 skills/bitrix24-agent/scripts/bitrix24_client.py user.current --params '{}' --list-packs
+```
+
+Enable additional packs for current call:
+
+```bash
+python3 skills/bitrix24-agent/scripts/bitrix24_client.py im.message.add \
+  --params '{"DIALOG_ID":"chat1","MESSAGE":"hello"}' \
+  --packs core,comms \
+  --confirm-write
+```
+
+Enable packs globally in env:
+
+```bash
+export B24_PACKS="core,comms"
+```
+
+Disable packs and rely only on explicit allowlist:
+
+```bash
+python3 skills/bitrix24-agent/scripts/bitrix24_client.py user.current --params '{}' --packs none --method-allowlist 'user.*'
+```
+
+## Practical API examples
+
+Create lead:
 
 ```bash
 python3 skills/bitrix24-agent/scripts/bitrix24_client.py crm.lead.add \
@@ -106,7 +161,7 @@ python3 skills/bitrix24-agent/scripts/bitrix24_client.py crm.lead.add \
   --confirm-write
 ```
 
-Update a lead:
+Update lead:
 
 ```bash
 python3 skills/bitrix24-agent/scripts/bitrix24_client.py crm.lead.update \
@@ -114,7 +169,7 @@ python3 skills/bitrix24-agent/scripts/bitrix24_client.py crm.lead.update \
   --confirm-write
 ```
 
-Execute batch:
+Batch call:
 
 ```bash
 python3 skills/bitrix24-agent/scripts/bitrix24_client.py batch --params '{
@@ -126,36 +181,21 @@ python3 skills/bitrix24-agent/scripts/bitrix24_client.py batch --params '{
 }' --confirm-write
 ```
 
-Offline event polling:
+Offline events worker:
 
 ```bash
 python3 skills/bitrix24-agent/scripts/offline_sync_worker.py --once
 ```
 
-Audit output default path:
+## OpenClaw / Moltbot
 
-```text
-.runtime/bitrix24_audit.jsonl
-```
-
-You can override or disable:
-
-```bash
-python3 skills/bitrix24-agent/scripts/bitrix24_client.py user.current --params '{}' --audit-file /tmp/b24_audit.jsonl
-python3 skills/bitrix24-agent/scripts/bitrix24_client.py user.current --params '{}' --no-audit
-```
-
-## OpenClaw / Moltbot Connection
-
-This repository is already in Agent Skill layout. The skill path is:
+Skill path in this repo:
 
 ```text
 skills/bitrix24-agent
 ```
 
 OpenClaw:
-- Keep this repo as workspace and point skills discovery to `skills/`.
-- Or copy skill folder to your global skills directory:
 
 ```bash
 mkdir -p ~/.openclaw/skills
@@ -169,95 +209,49 @@ mkdir -p ~/.moltbot/skills
 cp -R skills/bitrix24-agent ~/.moltbot/skills/bitrix24-agent
 ```
 
-After copy, restart runtime or refresh skill cache.
+Restart runtime or refresh skill cache.
 
-## Bitrix24 MCP (Optional, For Better Code Generation)
+## User scenarios (short list)
 
-Bitrix24 provides an MCP endpoint for documentation-aware assistance:
-- Docs: https://github.com/bitrix-tools/b24-rest-docs/blob/main/sdk/mcp.md
-- Endpoint: use the current server URL from official docs.
+1. Create lead from external form.
+2. Enrich lead with external data.
+3. Auto-route lead by score.
+4. Create task on deal stage change.
+5. Write AI summary to CRM comments.
+6. Bulk update entities with guarded batch.
+7. Sync selected CRM fields to external DB.
+8. Detect stale deals and escalate.
+9. Recover missed updates with offline events.
+10. Trigger bizproc workflow from CRM event.
+11. Send notification to chat on task changes.
+12. Register bot command and return structured answer.
+13. Manage workgroup metadata and members flow.
+14. Upload and attach files to process entities.
+15. Run scrum board updates from external triggers.
 
-According to Bitrix24 MCP docs, this endpoint is available without authorization and is meant to improve prompt-time API accuracy.
-Use it for method/parameter discovery, not as a production runtime transport.
+## Reliability and safety
 
-Minimal MCP config example:
+- Schema validation for method + params.
+- Allowlist + capability packs.
+- Risk gate flags:
+  - `--confirm-write`
+  - `--confirm-destructive`
+- Retry/backoff for transient API overload.
+- Optional OAuth auto-refresh callback.
+- JSONL audit trail (default: `.runtime/bitrix24_audit.jsonl`).
 
-```json
-{
-  "servers": {
-    "b24-dev-mcp": {
-      "url": "<mcp_server_url_from_official_docs>",
-      "type": "http"
-    }
-  }
-}
-```
+## Security checklist
 
-## User Scenarios
+- Keep `.env` out of git.
+- Never expose webhook/OAuth secrets in client-side code.
+- Verify `application_token` in inbound handlers.
+- Keep scopes minimal.
+- Use `--allow-unlisted` only as controlled exception.
 
-1. Auto-create a lead from a form submission.
-2. Enrich new leads with external profile data.
-3. Route leads by custom qualification rules.
-4. Trigger follow-up tasks on deal stage changes.
-5. Write AI summaries into deal comments.
-6. Sync selected CRM entities to external storage.
-7. Detect stale deals and trigger escalations.
-8. Run daily data reconciliation for missed updates.
-9. Build score-based lead prioritization.
-10. Execute safe bulk updates via batch calls.
-11. Normalize inconsistent contact fields.
-12. Build event-driven handoff from sales to delivery.
-13. Trigger approval workflows for high-value deals.
-14. Keep external systems aligned with task changes.
-15. Build no-loss processing with offline queue + DLQ.
+## Common errors
 
-## Reliability Model
-
-- API client handles transient failures with retry/backoff.
-- Invalid `event.offline.get` payloads are rejected by schema checks.
-- Offline worker supports no-loss style processing:
-  - pull events,
-  - process with retry budget,
-  - move poison events to DLQ,
-  - clear only acknowledged events.
-- Keep event handlers fast and asynchronous.
-
-## CI Quality Gate
-
-GitHub Actions workflow (`.github/workflows/ci.yml`) runs:
-- Python syntax validation (`compileall`) for scripts.
-- Unit tests (`unittest`) when `tests/` exists in repository.
-
-## Security Checklist
-
-- `.env` stays out of git.
-- Never log raw secrets or tokens.
-- Keep webhook secret and OAuth credentials private.
-- Validate `application_token` for inbound events.
-- Use least-privilege permissions/scopes.
-- Keep allowlist strict; use `--allow-unlisted` only for controlled exceptions.
-
-## Common Errors
-
-- `Method not found`: wrong method path or webhook parts (`USER_ID`, `WEBHOOK_CODE`).
-- `WRONG_AUTH_TYPE`: method requires another auth model (often app/OAuth context).
-- `QUERY_LIMIT_EXCEEDED`: too many requests; reduce concurrency and rely on backoff.
-- `insufficient_scope`: missing rights/scopes.
+- `Method not found`: wrong method/path/auth URL format.
+- `WRONG_AUTH_TYPE`: method requires a different auth context.
+- `QUERY_LIMIT_EXCEEDED`: too much request intensity.
+- `insufficient_scope`: missing scopes/permissions.
 - `expired_token`: refresh OAuth token and retry.
-
-## Using As Agent Skill
-
-Point your runtime to:
-
-```text
-skills/bitrix24-agent
-```
-
-Runtime should load:
-- `SKILL.md` as instruction entry,
-- `references/bitrix24.md` as implementation playbook,
-- scripts for deterministic execution paths.
-
-## License
-
-The Unlicense.

@@ -1,6 +1,6 @@
 # Bitrix24 REST for AI Agents (Ultimate Guide)
 
-Last reviewed against `bitrix-tools/b24-rest-docs` commit `2803bad82e5189d6d9a42eba9802a52ad6c5d87c` (2026-02-13).
+Last reviewed against `bitrix24/b24restdocs` commit `66a5c0e8420a78c40b7fe7c7cf474d8bac8cb2be` (2026-02-14).
 
 ## Table of Contents
 
@@ -244,6 +244,31 @@ When implementing `imbot` flows, enforce these constraints:
 - For multiple bot commands in one app, handler endpoint must be shared; route internally by event payload.
 - `imbot.message.add` and `imbot.command.answer`: `ATTACH`, `KEYBOARD`, `MENU` have 30 KB limits each.
 - `ONIMBOTMESSAGEADD`: auth tokens may be missing in some callbacks; keep previously stored app tokens.
+
+### 6.7 Capability packs (thin skill model)
+
+Keep runtime policy thin and expand by packs:
+- `core`
+- `comms`
+- `automation`
+- `collab`
+- `content`
+- `boards`
+
+Companion docs in this skill:
+- `references/packs.md`
+- `references/catalog-core.md`
+- `references/catalog-comms.md`
+- `references/catalog-automation.md`
+- `references/catalog-collab.md`
+- `references/catalog-content.md`
+- `references/catalog-boards.md`
+- `references/chains-core.md`
+- `references/chains-comms.md`
+- `references/chains-automation.md`
+- `references/chains-collab.md`
+- `references/chains-content.md`
+- `references/chains-boards.md`
 
 ## 7. `batch` Without Shooting Yourself in the Foot
 
@@ -664,23 +689,23 @@ Use them as a baseline; adapt storage, queues, and locks to your runtime.
 
 ## 19. Primary Sources
 
-- Main docs repository: https://github.com/bitrix-tools/b24-rest-docs
-- First call and webhook basics: https://github.com/bitrix-tools/b24-rest-docs/blob/main/first-steps/first-rest-api-call.md
-- Access and scopes overview: https://github.com/bitrix-tools/b24-rest-docs/blob/main/first-steps/access-to-rest-api.md
-- OAuth protocol: https://github.com/bitrix-tools/b24-rest-docs/blob/main/settings/oauth/index.md
-- Limits and throttling: https://github.com/bitrix-tools/b24-rest-docs/blob/main/limits.md
-- General call principles: https://github.com/bitrix-tools/b24-rest-docs/blob/main/settings/how-to-call-rest-api/general-principles.md
-- Batch: https://github.com/bitrix-tools/b24-rest-docs/blob/main/settings/how-to-call-rest-api/batch.md
-- System errors: https://github.com/bitrix-tools/b24-rest-docs/blob/main/_includes/system-errors.md
-- Events overview: https://github.com/bitrix-tools/b24-rest-docs/blob/main/api-reference/events/index.md
-- Event bind: https://github.com/bitrix-tools/b24-rest-docs/blob/main/api-reference/events/event-bind.md
-- Offline events: https://github.com/bitrix-tools/b24-rest-docs/blob/main/api-reference/events/offline-events.md
-- Event handler security: https://github.com/bitrix-tools/b24-rest-docs/blob/main/api-reference/events/safe-event-handlers.md
-- REST 3.0 overview: https://github.com/bitrix-tools/b24-rest-docs/blob/main/api-reference/rest-v3/index.md
-- Scopes list: https://github.com/bitrix-tools/b24-rest-docs/blob/main/api-reference/scopes/permissions.md
-- Network access: https://github.com/bitrix-tools/b24-rest-docs/blob/main/settings/cloud-and-on-premise/network-access.md
+- Main docs repository: https://github.com/bitrix24/b24restdocs
+- First call and webhook basics: https://github.com/bitrix24/b24restdocs/blob/main/first-steps/first-rest-api-call.md
+- Access and scopes overview: https://github.com/bitrix24/b24restdocs/blob/main/first-steps/access-to-rest-api.md
+- OAuth protocol: https://github.com/bitrix24/b24restdocs/blob/main/settings/oauth/index.md
+- Limits and throttling: https://github.com/bitrix24/b24restdocs/blob/main/limits.md
+- General call principles: https://github.com/bitrix24/b24restdocs/blob/main/settings/how-to-call-rest-api/general-principles.md
+- Batch: https://github.com/bitrix24/b24restdocs/blob/main/settings/how-to-call-rest-api/batch.md
+- System errors: https://github.com/bitrix24/b24restdocs/blob/main/_includes/system-errors.md
+- Events overview: https://github.com/bitrix24/b24restdocs/blob/main/api-reference/events/index.md
+- Event bind: https://github.com/bitrix24/b24restdocs/blob/main/api-reference/events/event-bind.md
+- Offline events: https://github.com/bitrix24/b24restdocs/blob/main/api-reference/events/offline-events.md
+- Event handler security: https://github.com/bitrix24/b24restdocs/blob/main/api-reference/events/safe-event-handlers.md
+- REST 3.0 overview: https://github.com/bitrix24/b24restdocs/blob/main/api-reference/rest-v3/index.md
+- Scopes list: https://github.com/bitrix24/b24restdocs/blob/main/api-reference/scopes/permissions.md
+- Network access: https://github.com/bitrix24/b24restdocs/blob/main/settings/cloud-and-on-premise/network-access.md
 - MCP for Bitrix24 docs access:
-  - https://github.com/bitrix-tools/b24-rest-docs/blob/main/sdk/mcp.md
+  - https://github.com/bitrix24/b24restdocs/blob/main/sdk/mcp.md
 
 ## 20. Notes About External Recommendations
 
