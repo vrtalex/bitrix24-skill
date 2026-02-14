@@ -4,16 +4,19 @@
 This worker:
 - pulls offline events via event.offline.get(clear=0),
 - retries failed records with bounded budget,
-- sends exhausted records to DLQ jsonl,
-- clears only successfully processed (or DLQ'ed) records.
+- sends exhausted records to DLQ jsonl with file locking,
+- clears only successfully processed (or DLQ'ed) records,
+- supports graceful shutdown via SIGTERM/SIGINT.
 """
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import pathlib
+import signal
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
@@ -22,7 +25,30 @@ THIS_DIR = pathlib.Path(__file__).resolve().parent
 if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
-from bitrix24_client import Bitrix24Client, BitrixAPIError, load_tenant_config_from_env
+from bitrix24_client import (
+    Bitrix24Client,
+    BitrixAPIError,
+    TokenStore,
+    load_tenant_config_from_env,
+    secure_compare,
+)
+
+
+class GracefulShutdown:
+    """Handle graceful shutdown on SIGTERM/SIGINT."""
+
+    def __init__(self) -> None:
+        self._shutdown_requested = False
+        signal.signal(signal.SIGTERM, self._handle_signal)
+        signal.signal(signal.SIGINT, self._handle_signal)
+
+    def _handle_signal(self, signum: int, frame: Any) -> None:
+        print(f"\nReceived signal {signum}, shutting down gracefully...")
+        self._shutdown_requested = True
+
+    @property
+    def should_stop(self) -> bool:
+        return self._shutdown_requested
 
 
 def parse_offline_get(response: Dict[str, Any]) -> Tuple[Optional[str], List[Dict[str, Any]]]:
@@ -62,6 +88,17 @@ def event_dedup_key(event_item: Dict[str, Any]) -> str:
     return f"{event_name}:{digest}"
 
 
+def validate_application_token(
+    event_auth: Dict[str, Any],
+    expected_token: Optional[str],
+) -> bool:
+    """Validate application_token from event using constant-time comparison."""
+    if expected_token is None:
+        return True  # No validation configured
+    received_token = event_auth.get("application_token")
+    return secure_compare(received_token, expected_token)
+
+
 class RetryBudget:
     def __init__(self, state_file: pathlib.Path, max_retries: int) -> None:
         self.state_file = state_file
@@ -80,7 +117,10 @@ class RetryBudget:
 
     def save(self) -> None:
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        self.state_file.write_text(json.dumps(self._state, ensure_ascii=True, indent=2), encoding="utf-8")
+        # Use atomic write with temp file
+        temp_file = self.state_file.with_suffix(".tmp")
+        temp_file.write_text(json.dumps(self._state, ensure_ascii=True, indent=2), encoding="utf-8")
+        temp_file.rename(self.state_file)
 
     def fail(self, key: str) -> int:
         count = self._state.get(key, 0) + 1
@@ -95,7 +135,15 @@ class RetryBudget:
         return self._state.get(key, 0) >= self.max_retries
 
 
-def write_dlq(dlq_path: pathlib.Path, *, tenant: str, event_item: Dict[str, Any], error: str, retries: int) -> None:
+def write_dlq(
+    dlq_path: pathlib.Path,
+    *,
+    tenant: str,
+    event_item: Dict[str, Any],
+    error: str,
+    retries: int,
+) -> None:
+    """Write to DLQ with file locking to prevent corruption from concurrent writes."""
     dlq_path.parent.mkdir(parents=True, exist_ok=True)
     row = {
         "tenant": tenant,
@@ -106,8 +154,16 @@ def write_dlq(dlq_path: pathlib.Path, *, tenant: str, event_item: Dict[str, Any]
         "payload": event_item,
         "ts": int(time.time()),
     }
+    row_json = json.dumps(row, ensure_ascii=True) + "\n"
+
+    # Open with append mode and use exclusive lock for the write
     with dlq_path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(row, ensure_ascii=True) + "\n")
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            fh.write(row_json)
+            fh.flush()
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
 def process_event_default(event_item: Dict[str, Any]) -> None:
@@ -134,8 +190,9 @@ def run_once(
     tenant_key: str,
     retry_budget: RetryBudget,
     dlq_path: pathlib.Path,
+    application_token: Optional[str] = None,
 ) -> int:
-    response = client.call("event.offline.get", params={"clear": 0})
+    response = client.call("event.offline.get", params={"clear": "0"})
     process_id, events = parse_offline_get(response)
     if not process_id or not events:
         return 0
@@ -143,6 +200,14 @@ def run_once(
     clear_ids: List[str] = []
     has_pending_failures = False
     for event_item in events:
+        # Validate application_token if configured
+        event_auth = event_item.get("auth") or {}
+        if not validate_application_token(event_auth, application_token):
+            # Log security event and skip (don't clear - might be injection attempt)
+            print(f"SECURITY: Invalid application_token for event {event_message_id(event_item)}")
+            has_pending_failures = True
+            continue
+
         dedup = event_dedup_key(event_item)
         msg_id = event_message_id(event_item)
         try:
@@ -189,36 +254,68 @@ def parse_args() -> argparse.Namespace:
         default=".runtime/offline_dlq.jsonl",
         help="Path to DLQ jsonl output",
     )
+    parser.add_argument(
+        "--application-token",
+        default=None,
+        help="Expected application_token for event validation (optional)",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
 
-    tenant = load_tenant_config_from_env()
+    # Setup graceful shutdown handler
+    shutdown = GracefulShutdown()
+
+    tenant, token_store = load_tenant_config_from_env()
     tenant_key = tenant.domain
-    client = Bitrix24Client(tenant)
+    client = Bitrix24Client(tenant, token_store=token_store)
     retry_budget = RetryBudget(pathlib.Path(args.state_file), max_retries=args.max_retries)
     dlq_path = pathlib.Path(args.dlq_file)
 
-    while True:
+    consecutive_errors = 0
+    max_consecutive_errors = 10
+
+    while not shutdown.should_stop:
         try:
             count = run_once(
                 client,
                 tenant_key=tenant_key,
                 retry_budget=retry_budget,
                 dlq_path=dlq_path,
+                application_token=args.application_token,
             )
+            consecutive_errors = 0  # Reset on success
+
             if args.once:
                 print(f"Processed batch size: {count}")
                 return
             if count == 0:
                 time.sleep(args.sleep)
         except BitrixAPIError as exc:
+            consecutive_errors += 1
             print(f"Bitrix API error: code={exc.code} status={exc.status} msg={exc}")
+
+            # Circuit breaker for fatal errors
+            if exc.fatal:
+                print(f"FATAL: Error code {exc.code} is not recoverable. Exiting.")
+                sys.exit(1)
+
             if args.once:
                 return
+
+            # Circuit breaker for too many consecutive errors
+            if consecutive_errors >= max_consecutive_errors:
+                print(f"FATAL: {consecutive_errors} consecutive errors. Exiting to prevent infinite loop.")
+                sys.exit(1)
+
             time.sleep(args.sleep)
+        except KeyboardInterrupt:
+            print("\nInterrupted by user")
+            break
+
+    print("Worker stopped gracefully")
 
 
 if __name__ == "__main__":
