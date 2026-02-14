@@ -48,6 +48,7 @@ Short rule:
 ## Bitrix24 setup for external systems (quick admin manual)
 
 Source: https://helpdesk.bitrix24.com/open/25866707/
+Additional setup reference: https://helpdesk.bitrix24.com/open/21133100/
 
 1. Enable external AI connections in Bitrix24 (admin only):
 - Open account menu -> `Settings` -> `MCP servers`.
@@ -65,6 +66,25 @@ Source: https://helpdesk.bitrix24.com/open/25866707/
 4. Disable or revoke when needed:
 - Admin can disable global toggle in `Settings` -> `MCP servers`.
 - Users can revoke specific connections via `Apps` -> `MCP connections` -> `My tokens`.
+
+5. Configure Developer resources for REST/webhook integrations:
+- Open `Developer resources` in your Bitrix24 account.
+- Confirm your plan includes webhooks/local apps.
+- Any user can create webhooks.
+- Only administrators can create local applications.
+- Assign minimum required permissions for each webhook/app.
+
+6. Webhook safety and ownership rules:
+- Keep webhook secret key confidential (do not place it in frontend/public code).
+- Webhook URL includes portal, `/rest`, creator user id, secret key, method, and params.
+- If an admin edits another user's webhook, the secret key is reset and ownership moves to that admin.
+
+7. Operations visibility and REST load checks:
+- Use the `Integrations` tab to see created webhooks/apps, their events, access, and owner.
+- Admins can see all integrations; regular users can see only their own.
+- Use the `Statistics` tab to inspect request volume and REST load.
+- Statistics filters support up to 14 days window.
+- REST load article: https://helpdesk.bitrix24.com/open/21001036/
 
 ## Capability packs (recommended model)
 
