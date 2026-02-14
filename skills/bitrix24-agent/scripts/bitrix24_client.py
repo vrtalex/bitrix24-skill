@@ -15,18 +15,22 @@ Features:
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hmac
 import json
 import os
+import pathlib
 import random
 import re
+import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 # Maximum backoff delay in milliseconds to prevent overflow
 MAX_BACKOFF_MS = 30_000
@@ -50,6 +54,66 @@ FATAL_ERROR_CODES: Set[str] = frozenset({
     "PAYMENT_REQUIRED",
 })
 
+DEFAULT_METHOD_ALLOWLIST: Tuple[str, ...] = (
+    "batch",
+    "user.*",
+    "department.*",
+    "crm.*",
+    "tasks.*",
+    "task.*",
+    "event.*",
+    "imbot.*",
+    "im.*",
+    "ai.*",
+)
+
+METHOD_NAME_SCHEMA: Dict[str, Any] = {
+    "type": "string",
+    "pattern": r"^[a-z0-9_]+(?:\.[a-z0-9_]+)*$",
+    "minLength": 3,
+}
+
+GENERIC_PARAMS_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": True,
+}
+
+BATCH_PARAMS_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "required": ["cmd"],
+    "additionalProperties": True,
+    "properties": {
+        "cmd": {
+            "type": "object",
+            "minProperties": 1,
+            "maxProperties": 50,
+            "additionalProperties": {"type": "string"},
+        },
+        "halt": {
+            "anyOf": [
+                {"type": "boolean"},
+                {"type": "integer", "enum": [0, 1]},
+            ]
+        },
+    },
+}
+
+EVENT_OFFLINE_GET_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": True,
+    "properties": {
+        "clear": {
+            "anyOf": [
+                {"type": "integer", "enum": [0, 1]},
+                {"type": "string", "enum": ["0", "1"]},
+            ]
+        }
+    },
+}
+
+WRITE_METHOD_RE = re.compile(r"(?:^|\.)(add|update|set|register|bind|import|complete|start|stop|move|clear)$")
+DESTRUCTIVE_METHOD_RE = re.compile(r"(?:^|\.)(delete|remove|recyclebin|unregister|unbind)$")
+
 
 def mask_secrets(text: str) -> str:
     """Mask sensitive values in text for safe logging."""
@@ -64,6 +128,152 @@ def secure_compare(a: Optional[str], b: Optional[str]) -> bool:
     if a is None or b is None:
         return False
     return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
+
+def _matches_type(value: Any, expected: str) -> bool:
+    if expected == "object":
+        return isinstance(value, dict)
+    if expected == "array":
+        return isinstance(value, list)
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "null":
+        return value is None
+    return False
+
+
+def validate_json_schema(value: Any, schema: Dict[str, Any], path: str = "$") -> None:
+    if "anyOf" in schema:
+        sub_errors: List[str] = []
+        for sub_schema in schema["anyOf"]:
+            try:
+                validate_json_schema(value, sub_schema, path=path)
+                return
+            except ValueError as exc:
+                sub_errors.append(str(exc))
+        raise ValueError(f"{path}: value does not match any allowed schema ({'; '.join(sub_errors)})")
+
+    expected_type = schema.get("type")
+    if expected_type and not _matches_type(value, expected_type):
+        raise ValueError(f"{path}: expected type {expected_type}")
+
+    if "enum" in schema and value not in schema["enum"]:
+        raise ValueError(f"{path}: value {value!r} not in enum {schema['enum']}")
+
+    if isinstance(value, str):
+        if "minLength" in schema and len(value) < schema["minLength"]:
+            raise ValueError(f"{path}: string shorter than minLength={schema['minLength']}")
+        if "maxLength" in schema and len(value) > schema["maxLength"]:
+            raise ValueError(f"{path}: string longer than maxLength={schema['maxLength']}")
+        if "pattern" in schema and not re.match(schema["pattern"], value):
+            raise ValueError(f"{path}: string does not match required pattern")
+
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if "minimum" in schema and value < schema["minimum"]:
+            raise ValueError(f"{path}: number less than minimum={schema['minimum']}")
+        if "maximum" in schema and value > schema["maximum"]:
+            raise ValueError(f"{path}: number greater than maximum={schema['maximum']}")
+
+    if isinstance(value, list):
+        if "minItems" in schema and len(value) < schema["minItems"]:
+            raise ValueError(f"{path}: array shorter than minItems={schema['minItems']}")
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            raise ValueError(f"{path}: array longer than maxItems={schema['maxItems']}")
+        items_schema = schema.get("items")
+        if items_schema:
+            for idx, item in enumerate(value):
+                validate_json_schema(item, items_schema, path=f"{path}[{idx}]")
+
+    if isinstance(value, dict):
+        required = schema.get("required", [])
+        for key in required:
+            if key not in value:
+                raise ValueError(f"{path}: missing required field '{key}'")
+
+        properties = schema.get("properties", {})
+        for key, item in value.items():
+            if key in properties:
+                validate_json_schema(item, properties[key], path=f"{path}.{key}")
+            else:
+                additional = schema.get("additionalProperties", True)
+                if additional is False:
+                    raise ValueError(f"{path}: unexpected field '{key}'")
+                if isinstance(additional, dict):
+                    validate_json_schema(item, additional, path=f"{path}.{key}")
+
+        if "minProperties" in schema and len(value) < schema["minProperties"]:
+            raise ValueError(f"{path}: object has fewer fields than minProperties={schema['minProperties']}")
+        if "maxProperties" in schema and len(value) > schema["maxProperties"]:
+            raise ValueError(f"{path}: object has more fields than maxProperties={schema['maxProperties']}")
+
+
+def parse_method_allowlist(raw: Optional[str]) -> List[str]:
+    if not raw:
+        return list(DEFAULT_METHOD_ALLOWLIST)
+    patterns = [pattern.strip().lower() for pattern in raw.split(",") if pattern.strip()]
+    return patterns or list(DEFAULT_METHOD_ALLOWLIST)
+
+
+def is_method_allowed(method: str, patterns: Sequence[str]) -> bool:
+    method_l = method.lower()
+    return any(fnmatch.fnmatchcase(method_l, pattern) for pattern in patterns)
+
+
+def batch_command_method(command: str) -> str:
+    method = command.split("?", 1)[0].strip().lower()
+    return method
+
+
+def classify_method_risk(method: str, params: Optional[Dict[str, Any]] = None) -> str:
+    method_l = method.lower()
+    if method_l == "batch":
+        cmd = (params or {}).get("cmd", {})
+        if isinstance(cmd, dict):
+            batch_risks = [classify_method_risk(batch_command_method(v), None) for v in cmd.values() if isinstance(v, str)]
+            if "destructive" in batch_risks:
+                return "destructive"
+            if "write" in batch_risks:
+                return "write"
+        return "read"
+
+    if DESTRUCTIVE_METHOD_RE.search(method_l):
+        return "destructive"
+    if WRITE_METHOD_RE.search(method_l):
+        return "write"
+    return "read"
+
+
+def validate_method_and_params(method: str, params: Dict[str, Any]) -> None:
+    validate_json_schema(method, METHOD_NAME_SCHEMA, path="method")
+    validate_json_schema(params, GENERIC_PARAMS_SCHEMA, path="params")
+    if method == "batch":
+        validate_json_schema(params, BATCH_PARAMS_SCHEMA, path="params")
+    elif method == "event.offline.get":
+        validate_json_schema(params, EVENT_OFFLINE_GET_SCHEMA, path="params")
+
+
+def get_audit_file_path(cli_value: Optional[str]) -> Optional[pathlib.Path]:
+    if cli_value is not None:
+        raw = cli_value.strip()
+    else:
+        raw = os.getenv("B24_AUDIT_FILE", ".runtime/bitrix24_audit.jsonl").strip()
+    if not raw:
+        return None
+    return pathlib.Path(raw)
+
+
+def write_audit_row(audit_file: Optional[pathlib.Path], row: Dict[str, Any]) -> None:
+    if audit_file is None:
+        return
+    audit_file.parent.mkdir(parents=True, exist_ok=True)
+    with audit_file.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row, ensure_ascii=True) + "\n")
 
 
 @dataclass(frozen=True)
@@ -494,18 +704,138 @@ def main() -> None:
         dest="mask_secrets",
         help="Disable secrets masking in output",
     )
+    parser.add_argument(
+        "--method-allowlist",
+        default=os.getenv("B24_METHOD_ALLOWLIST", ""),
+        help="Comma-separated method allowlist patterns, e.g. 'user.*,crm.*,batch'",
+    )
+    parser.add_argument(
+        "--allow-unlisted",
+        action="store_true",
+        help="Allow methods outside allowlist for this call",
+    )
+    parser.add_argument(
+        "--confirm-write",
+        action="store_true",
+        help="Required for write methods and write batch commands",
+    )
+    parser.add_argument(
+        "--confirm-destructive",
+        action="store_true",
+        help="Required for destructive methods (delete/remove/unbind/unregister)",
+    )
+    parser.add_argument(
+        "--audit-file",
+        default=None,
+        help="Path to JSONL audit file (default: B24_AUDIT_FILE or .runtime/bitrix24_audit.jsonl)",
+    )
+    parser.add_argument(
+        "--no-audit",
+        action="store_true",
+        help="Disable audit logging for this call",
+    )
     args = parser.parse_args()
 
     try:
         params = json.loads(args.params)
     except json.JSONDecodeError as e:
-        print(f"Error: Invalid JSON in --params: {e}", file=__import__("sys").stderr)
+        print(f"Error: Invalid JSON in --params: {e}", file=sys.stderr)
         raise SystemExit(1)
+
+    if not isinstance(params, dict):
+        print("Error: --params must decode to a JSON object", file=sys.stderr)
+        raise SystemExit(1)
+
+    try:
+        validate_method_and_params(args.method, params)
+    except ValueError as exc:
+        print(f"Error: Schema validation failed: {exc}", file=sys.stderr)
+        raise SystemExit(2)
+
+    allowlist_patterns = parse_method_allowlist(args.method_allowlist)
+    method_allowed = is_method_allowed(args.method, allowlist_patterns)
+    if not method_allowed and not args.allow_unlisted:
+        print(
+            f"Error: method '{args.method}' is outside allowlist. "
+            "Use --allow-unlisted to bypass or extend --method-allowlist.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    if args.method == "batch":
+        batch_cmd = params.get("cmd", {})
+        if isinstance(batch_cmd, dict):
+            for name, command in batch_cmd.items():
+                if not isinstance(command, str):
+                    continue
+                command_method = batch_command_method(command)
+                if not is_method_allowed(command_method, allowlist_patterns) and not args.allow_unlisted:
+                    print(
+                        f"Error: batch command '{name}' uses non-allowlisted method '{command_method}'. "
+                        "Use --allow-unlisted to bypass.",
+                        file=sys.stderr,
+                    )
+                    raise SystemExit(2)
+
+    method_risk = classify_method_risk(args.method, params=params)
+    if method_risk == "write" and not args.confirm_write:
+        print(
+            "Error: write method detected. Add --confirm-write to execute.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    if method_risk == "destructive" and not args.confirm_destructive:
+        print(
+            "Error: destructive method detected. Add --confirm-destructive to execute.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
 
     tenant, token_store = load_tenant_config_from_env()
     refresh_callback = refresh_via_oauth_server if args.auto_refresh else None
     client = Bitrix24Client(tenant, token_store=token_store, refresh_callback=refresh_callback)
-    response = client.call(args.method, params=params, rest_v3=args.rest_v3)
+    request_id = uuid.uuid4().hex[:12]
+    started = time.time()
+    audit_file = None if args.no_audit else get_audit_file_path(args.audit_file)
+
+    try:
+        response = client.call(args.method, params=params, rest_v3=args.rest_v3)
+    except BitrixAPIError as exc:
+        write_audit_row(
+            audit_file,
+            {
+                "ts": int(time.time()),
+                "request_id": request_id,
+                "tenant": tenant.domain,
+                "method": args.method,
+                "risk": method_risk,
+                "status": "error",
+                "error_code": exc.code,
+                "error_message": str(exc),
+                "duration_ms": int((time.time() - started) * 1000),
+                "allowlisted": method_allowed,
+                "rest_v3": args.rest_v3,
+                "param_keys": sorted(params.keys()),
+            },
+        )
+        print(f"Bitrix API error: code={exc.code} status={exc.status} msg={exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+    write_audit_row(
+        audit_file,
+        {
+            "ts": int(time.time()),
+            "request_id": request_id,
+            "tenant": tenant.domain,
+            "method": args.method,
+            "risk": method_risk,
+            "status": "ok",
+            "duration_ms": int((time.time() - started) * 1000),
+            "allowlisted": method_allowed,
+            "rest_v3": args.rest_v3,
+            "param_keys": sorted(params.keys()),
+        },
+    )
 
     output = json.dumps(response, ensure_ascii=False, indent=2)
     if args.mask_secrets:

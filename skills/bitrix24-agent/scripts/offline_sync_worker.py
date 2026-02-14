@@ -28,7 +28,6 @@ if str(THIS_DIR) not in sys.path:
 from bitrix24_client import (
     Bitrix24Client,
     BitrixAPIError,
-    TokenStore,
     load_tenant_config_from_env,
     secure_compare,
 )
@@ -72,6 +71,20 @@ def parse_offline_get(response: Dict[str, Any]) -> Tuple[Optional[str], List[Dic
     return process_id, events
 
 
+def validate_offline_get_response_schema(response: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(response, dict):
+        return "response is not an object"
+    result = response.get("result")
+    if result is None:
+        return "missing result field"
+    if not isinstance(result, dict):
+        return "result is not an object"
+    process_id = result.get("process_id")
+    if process_id is not None and not isinstance(process_id, str):
+        return "result.process_id must be string when present"
+    return None
+
+
 def event_message_id(event_item: Dict[str, Any]) -> Optional[str]:
     for key in ("message_id", "MESSAGE_ID", "id", "ID"):
         value = event_item.get(key)
@@ -86,6 +99,21 @@ def event_dedup_key(event_item: Dict[str, Any]) -> str:
     stable = json.dumps(payload, sort_keys=True, ensure_ascii=True)
     digest = hashlib.sha256(stable.encode("utf-8")).hexdigest()[:16]
     return f"{event_name}:{digest}"
+
+
+def validate_event_item_schema(event_item: Dict[str, Any]) -> Optional[str]:
+    if not isinstance(event_item, dict):
+        return "event item is not an object"
+    event_name = event_item.get("event") or event_item.get("EVENT")
+    if event_name is not None and not isinstance(event_name, str):
+        return "event field must be a string"
+    data = event_item.get("data") or event_item.get("DATA")
+    if data is not None and not isinstance(data, dict):
+        return "data field must be an object"
+    auth = event_item.get("auth") or event_item.get("AUTH")
+    if auth is not None and not isinstance(auth, dict):
+        return "auth field must be an object"
+    return None
 
 
 def validate_application_token(
@@ -193,6 +221,13 @@ def run_once(
     application_token: Optional[str] = None,
 ) -> int:
     response = client.call("event.offline.get", params={"clear": "0"})
+    response_error = validate_offline_get_response_schema(response)
+    if response_error:
+        raise BitrixAPIError(
+            f"Invalid offline response schema: {response_error}",
+            code="INVALID_OFFLINE_RESPONSE_SCHEMA",
+            payload={"raw": response},
+        )
     process_id, events = parse_offline_get(response)
     if not process_id or not events:
         return 0
@@ -200,6 +235,22 @@ def run_once(
     clear_ids: List[str] = []
     has_pending_failures = False
     for event_item in events:
+        event_schema_error = validate_event_item_schema(event_item)
+        if event_schema_error:
+            msg_id = event_message_id(event_item)
+            write_dlq(
+                dlq_path,
+                tenant=tenant_key,
+                event_item=event_item,
+                error=f"INVALID_EVENT_SCHEMA: {event_schema_error}",
+                retries=0,
+            )
+            if msg_id:
+                clear_ids.append(msg_id)
+            else:
+                has_pending_failures = True
+            continue
+
         # Validate application_token if configured
         event_auth = event_item.get("auth") or {}
         if not validate_application_token(event_auth, application_token):

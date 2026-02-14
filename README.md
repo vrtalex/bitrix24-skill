@@ -28,6 +28,15 @@ skills/bitrix24-agent/
   agents/openai.yaml
 ```
 
+## Quality Guardrails Included
+
+- Input schema validation for method names and params.
+- Method allowlist with optional override.
+- Risk-based confirmation gates:
+  - `--confirm-write` for write operations,
+  - `--confirm-destructive` for delete/remove/unbind class operations.
+- JSONL audit trail for every CLI call (enabled by default).
+
 ## Integration Choice: When To Use What
 
 | Option | Use it when | Avoid it when |
@@ -62,7 +71,7 @@ cp .env.example .env
 Incoming webhook example:
 
 ```bash
-export B24_DOMAIN="your-portal.bitrix24.com"
+export B24_DOMAIN="your-portal.example"
 export B24_AUTH_MODE="webhook"
 export B24_WEBHOOK_USER_ID="1"
 export B24_WEBHOOK_CODE="your_webhook_code"
@@ -71,7 +80,7 @@ export B24_WEBHOOK_CODE="your_webhook_code"
 OAuth example:
 
 ```bash
-export B24_DOMAIN="your-portal.bitrix24.com"
+export B24_DOMAIN="your-portal.example"
 export B24_AUTH_MODE="oauth"
 export B24_ACCESS_TOKEN="your_access_token"
 export B24_REFRESH_TOKEN="your_refresh_token"
@@ -93,14 +102,16 @@ Create a lead:
 
 ```bash
 python3 skills/bitrix24-agent/scripts/bitrix24_client.py crm.lead.add \
-  --params '{"fields":{"TITLE":"Skill Demo Lead","NAME":"Agent"}}'
+  --params '{"fields":{"TITLE":"Skill Demo Lead","NAME":"Agent"}}' \
+  --confirm-write
 ```
 
 Update a lead:
 
 ```bash
 python3 skills/bitrix24-agent/scripts/bitrix24_client.py crm.lead.update \
-  --params '{"id":1,"fields":{"COMMENTS":"Updated by agent"}}'
+  --params '{"id":1,"fields":{"COMMENTS":"Updated by agent"}}' \
+  --confirm-write
 ```
 
 Execute batch:
@@ -112,13 +123,26 @@ python3 skills/bitrix24-agent/scripts/bitrix24_client.py batch --params '{
     "lead_list":"crm.lead.list?select[0]=ID&select[1]=TITLE",
     "user":"user.current"
   }
-}'
+}' --confirm-write
 ```
 
 Offline event polling:
 
 ```bash
 python3 skills/bitrix24-agent/scripts/offline_sync_worker.py --once
+```
+
+Audit output default path:
+
+```text
+.runtime/bitrix24_audit.jsonl
+```
+
+You can override or disable:
+
+```bash
+python3 skills/bitrix24-agent/scripts/bitrix24_client.py user.current --params '{}' --audit-file /tmp/b24_audit.jsonl
+python3 skills/bitrix24-agent/scripts/bitrix24_client.py user.current --params '{}' --no-audit
 ```
 
 ## OpenClaw / Moltbot Connection
@@ -147,6 +171,28 @@ cp -R skills/bitrix24-agent ~/.moltbot/skills/bitrix24-agent
 
 After copy, restart runtime or refresh skill cache.
 
+## Bitrix24 MCP (Optional, For Better Code Generation)
+
+Bitrix24 provides an MCP endpoint for documentation-aware assistance:
+- Docs: https://github.com/bitrix-tools/b24-rest-docs/blob/main/sdk/mcp.md
+- Endpoint: use the current server URL from official docs.
+
+According to Bitrix24 MCP docs, this endpoint is available without authorization and is meant to improve prompt-time API accuracy.
+Use it for method/parameter discovery, not as a production runtime transport.
+
+Minimal MCP config example:
+
+```json
+{
+  "servers": {
+    "b24-dev-mcp": {
+      "url": "<mcp_server_url_from_official_docs>",
+      "type": "http"
+    }
+  }
+}
+```
+
 ## User Scenarios
 
 1. Auto-create a lead from a form submission.
@@ -168,12 +214,19 @@ After copy, restart runtime or refresh skill cache.
 ## Reliability Model
 
 - API client handles transient failures with retry/backoff.
+- Invalid `event.offline.get` payloads are rejected by schema checks.
 - Offline worker supports no-loss style processing:
   - pull events,
   - process with retry budget,
   - move poison events to DLQ,
   - clear only acknowledged events.
 - Keep event handlers fast and asynchronous.
+
+## CI Quality Gate
+
+GitHub Actions workflow (`.github/workflows/ci.yml`) runs:
+- Python syntax validation (`compileall`) for scripts.
+- Unit tests (`unittest`) when `tests/` exists in repository.
 
 ## Security Checklist
 
@@ -182,6 +235,7 @@ After copy, restart runtime or refresh skill cache.
 - Keep webhook secret and OAuth credentials private.
 - Validate `application_token` for inbound events.
 - Use least-privilege permissions/scopes.
+- Keep allowlist strict; use `--allow-unlisted` only for controlled exceptions.
 
 ## Common Errors
 

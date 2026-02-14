@@ -679,7 +679,8 @@ Use them as a baseline; adapt storage, queues, and locks to your runtime.
 - REST 3.0 overview: https://github.com/bitrix-tools/b24-rest-docs/blob/main/api-reference/rest-v3/index.md
 - Scopes list: https://github.com/bitrix-tools/b24-rest-docs/blob/main/api-reference/scopes/permissions.md
 - Network access: https://github.com/bitrix-tools/b24-rest-docs/blob/main/settings/cloud-and-on-premise/network-access.md
-- MCP for Bitrix24 docs access: https://github.com/bitrix-tools/b24-rest-docs/blob/main/sdk/mcp.md
+- MCP for Bitrix24 docs access:
+  - https://github.com/bitrix-tools/b24-rest-docs/blob/main/sdk/mcp.md
 
 ## 20. Notes About External Recommendations
 
