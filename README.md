@@ -64,6 +64,16 @@ Pack docs:
 - Catalogs: `skills/bitrix24-agent/references/catalog-*.md`
 - Chains: `skills/bitrix24-agent/references/chains-*.md`
 
+## Token-efficient usage with agents
+
+For best quality/cost ratio, tell your agent to follow this mode:
+
+1. Start with `core` pack only.
+2. Read `references/packs.md` and one `catalog-<pack>.md` first.
+3. Open `chains-<pack>.md` only when implementation flow is required.
+4. Open `references/bitrix24.md` only for auth/limits/error deep-dive.
+5. Return concise answers first, then expand only on request.
+
 ## If the skill does not cover a Bitrix24 function
 
 1. Verify method in official docs (`bitrix24/b24restdocs`) and required scope.

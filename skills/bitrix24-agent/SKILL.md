@@ -3,87 +3,77 @@ name: bitrix24-agent
 description: Design, implement, debug, and harden integrations between AI agents and Bitrix24 REST API (webhooks, OAuth 2.0, scopes, events, batch, limits, and REST 3.0). Use when asked to connect AI assistants/agents to Bitrix24, automate CRM/tasks/chats, process Bitrix24 events, choose an auth model, or resolve Bitrix24 API errors and performance issues.
 ---
 
-# Bitrix24 Agent
+# Bitrix24 Agent (Lean + Reliable)
 
-This skill provides a production workflow for Bitrix24 integrations driven by AI agents.
-Use it to avoid common failures: wrong auth model, missing scopes, non-idempotent writes, event loss, and rate-limit collapse.
+Use this skill to deliver correct Bitrix24 integrations with minimal token usage.
 
-## Workflow
+## Default Mode: Lean
 
-1. Classify integration mode:
-- Single portal/internal integration: prefer incoming webhook.
-- Multi-tenant/local app/marketplace: OAuth 2.0 app model.
+Apply these limits unless the user asks for deep detail:
 
-2. Classify consistency and latency:
-- Near real-time reaction: online events.
-- Reliable synchronization without loss: offline events and queue polling.
+- Load at most 2 reference files before first actionable step.
+- Start from `references/packs.md`.
+- Then open only one target file: `references/catalog-<pack>.md`.
+- Open `references/chains-<pack>.md` only if user asks for workflow/chain.
+- Open `references/bitrix24.md` only for auth architecture, limits, events reliability, or unknown errors.
 
-3. Build minimal permission set:
-- Determine methods first.
-- Then derive required `scope` set.
-- Prefer least privilege.
+Response format limits:
 
-4. Implement request layer:
-- Use HTTPS only.
-- Parse error codes and `time` block.
-- Add retry/backoff for `QUERY_LIMIT_EXCEEDED` and transient `5xx`.
-- Add token refresh path for OAuth.
-- Add distributed rate limiting when multiple workers share one portal.
-- Add OAuth refresh lock/singleflight to prevent concurrent refresh races.
+- Use concise output (goal + next action + one command).
+- Do not retell documentation.
+- Do not dump large JSON unless explicitly requested.
+- Avoid repeating already provided guidance; return only delta.
 
-5. Implement guarded write path:
-- Read-before-write for critical updates.
-- Apply method allowlist policy before every call.
-- Use capability packs (`core`, `comms`, `automation`, `collab`, `content`, `boards`) to keep allowlist minimal.
-- Idempotency strategy in your app layer.
-- Add optimistic concurrency checks to avoid blind overwrite.
-- Explicit confirmation for destructive operations.
-- Audit logs with method, entity id, status, error code, latency.
+## Routing Workflow
 
-6. Harden event handling:
-- Verify `application_token` in handlers.
-- For offline flow, use `event.offline.get` + `process_id` + `event.offline.clear`.
-- Use `auth_connector` to avoid self-trigger loops where supported.
-- Implement DLQ (dead-letter queue) for poison events and bounded retries.
+1. Determine intent:
+- method call,
+- troubleshooting,
+- architecture decision,
+- event/reliability setup.
 
-7. Validate with contract tests:
-- Multi-portal token isolation.
-- OAuth refresh race behavior.
-- Pagination/full-sync correctness.
-- Offline event replay/idempotency and DLQ behavior.
+2. Choose auth quickly:
+- one portal/internal: incoming webhook.
+- app/multi-portal/lifecycle features: OAuth.
 
-## Guardrails
+3. Select minimal packs:
+- default `core`.
+- add only required packs: `comms`, `automation`, `collab`, `content`, `boards`.
 
-- Never expose webhook or OAuth secrets in frontend code.
-- Store secrets per portal/tenant; never use one global token for all portals.
-- Never assume method access without checking scope and user permissions.
-- Do not rely on online events as guaranteed delivery (no retries).
-- Do not chain nested `batch` calls (not allowed in modern REST versions).
-- Prefer REST 3.0 (`/rest/api/`) where applicable; keep v2 fallback for unsupported methods.
+4. Execute with guardrails:
+- prefer `scripts/bitrix24_client.py` and `scripts/offline_sync_worker.py`,
+- enforce allowlist + `--confirm-write` / `--confirm-destructive`,
+- keep writes idempotent when possible.
 
-## Reference Usage
+5. Escalate to deep reference only on trigger:
+- `WRONG_AUTH_TYPE`, `insufficient_scope`, `QUERY_LIMIT_EXCEEDED`, `expired_token`,
+- offline event loss concerns,
+- OAuth refresh race or tenant isolation issues.
 
-Read `references/bitrix24.md` before implementation. It includes:
-- auth decision matrix and architecture patterns,
-- scope and method playbooks,
-- error/retry strategy,
-- events and sync blueprints,
-- security checklist,
-- ready-to-use request templates.
-- ready-to-run Python utilities in `scripts/`.
-- pack index and modular method catalogs/chains in `references/packs.md`, `references/catalog-*.md`, `references/chains-*.md`.
+## Quality Guardrails
 
-Quick section navigation:
+- Never expose webhook/OAuth secrets.
+- Scope and permissions must be least-privilege.
+- No nested `batch`.
+- Online events are not guaranteed delivery; use offline flow for no-loss processing.
+- Prefer REST 3.0 where compatible; fallback to v2 where needed.
+
+## Reference Loading Map
+
+1. `references/packs.md` for pack and loading strategy.
+2. `references/catalog-<pack>.md` for method shortlist.
+3. `references/chains-<pack>.md` for implementation chains.
+4. `references/bitrix24.md` only when deeper protocol detail is required.
+
+Useful search shortcuts:
 
 ```bash
-rg -n "^## " references/bitrix24.md
-rg -n "QUERY_LIMIT_EXCEEDED|insufficient_scope|expired_token" references/bitrix24.md
-rg -n "offline|event\\.bind|event\\.offline" references/bitrix24.md
-rg -n "allowlist|DLQ|singleflight|pagination|contract tests" references/bitrix24.md
 rg -n "^# Catalog|^# Chains" references/catalog-*.md references/chains-*.md
+rg -n "WRONG_AUTH_TYPE|insufficient_scope|QUERY_LIMIT_EXCEEDED|expired_token" references/bitrix24.md
+rg -n "offline|event\\.bind|event\\.offline|application_token" references/bitrix24.md
 ```
 
 ## Scripts
 
-- `scripts/bitrix24_client.py`: request client with retries, rate limit backoff, and optional OAuth refresh callback.
-- `scripts/offline_sync_worker.py`: offline queue worker with bounded retries and DLQ output.
+- `scripts/bitrix24_client.py`: method calls, packs, allowlist, confirmations, audit.
+- `scripts/offline_sync_worker.py`: offline queue processing with retries and DLQ.

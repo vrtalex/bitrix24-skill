@@ -22,9 +22,4 @@ jobs:
           python -m compileall -q skills/bitrix24-agent/scripts
 
       - name: Unit tests
-        run: |
-          if [ -d tests ]; then
-            python -m unittest discover -s tests -v
-          else
-            echo "No tests directory found. Skipping."
-          fi
+        run: python -m unittest discover -s tests -v

@@ -2,6 +2,21 @@
 
 This skill stays thin by default and expands safely via packs.
 
+## Token-Efficient Loading Order
+
+Use this exact order:
+
+1. Open this file (`packs.md`).
+2. Open one `catalog-<pack>.md`.
+3. Open `chains-<pack>.md` only if workflow detail is needed.
+4. Open `bitrix24.md` only for protocol-level troubleshooting.
+
+Context budget:
+
+- default: max 2 files before first action,
+- max 1 active pack unless task explicitly spans multiple domains,
+- keep `core` as default pack.
+
 ## Packs
 
 - `core`: crm + tasks.task + user + events + batch
@@ -24,3 +39,4 @@ This skill stays thin by default and expands safely via packs.
 2. Keep high-risk write methods explicit and documented.
 3. Include at least one read-first chain before write chain.
 4. Link every method to official docs.
+5. Keep each catalog short; move detail to chains.
