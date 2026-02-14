@@ -76,6 +76,42 @@ set +a
 python3 skills/bitrix24-agent/scripts/bitrix24_client.py user.current --params '{}' --auto-refresh
 ```
 
+## Decision Matrix (Webhook / OAuth / Outgoing Webhook / MCP)
+
+| Option | Best for | Tradeoffs |
+|---|---|---|
+| Incoming Webhook | Fast start on one portal, simple REST automations | Long-lived secret; limited app-context capabilities |
+| OAuth App | Multi-tenant apps, advanced events, app lifecycle, robust production setup | More setup complexity (tokens, refresh, install flow) |
+| Outgoing Webhook (events to your handler) | Event-driven reactions from portal changes | No retry delivery; handler must be publicly reachable and fast |
+| Bitrix24 MCP Server | Better code generation and method discovery for AI development | Developer-assist layer only; not a runtime transport for production calls |
+
+Rule of thumb:
+- Runtime data/actions: Incoming Webhook or OAuth.
+- Event push trigger: Outgoing Webhook.
+- Better AI implementation quality: MCP.
+
+## Quick Start (Outgoing Webhook Events)
+
+1. Create a public HTTPS endpoint (for example, `/b24/events`) in your backend.
+2. In Bitrix24, create an outgoing webhook and select target events (for example, deal/task updates).
+3. Configure webhook to call your endpoint.
+4. In handler, process `application/x-www-form-urlencoded` payload and return `200` quickly.
+5. Push heavy logic to internal queue/worker instead of doing it inline.
+
+Minimal handler pattern:
+
+```js
+app.post("/b24/events", express.urlencoded({ extended: true }), (req, res) => {
+  // 1) Validate request token/signature fields according to your webhook setup
+  // 2) Enqueue event for async processing
+  // 3) Respond immediately
+  res.status(200).send("OK");
+});
+```
+
+Reliability note:
+- Outgoing webhook delivery is not a full retry queue. For strict "no-loss" sync requirements, use app/OAuth context with offline event patterns.
+
 ## Event/Queue Tests
 
 `events` and `event.offline.*` require app/OAuth context.
