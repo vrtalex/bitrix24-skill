@@ -254,6 +254,11 @@ Keep runtime policy thin and expand by packs:
 - `collab`
 - `content`
 - `boards`
+- `commerce`
+- `services`
+- `platform`
+- `sites`
+- `compliance`
 
 Companion docs in this skill:
 - `references/packs.md`
@@ -263,12 +268,22 @@ Companion docs in this skill:
 - `references/catalog-collab.md`
 - `references/catalog-content.md`
 - `references/catalog-boards.md`
+- `references/catalog-commerce.md`
+- `references/catalog-services.md`
+- `references/catalog-platform.md`
+- `references/catalog-sites.md`
+- `references/catalog-compliance.md`
 - `references/chains-core.md`
 - `references/chains-comms.md`
 - `references/chains-automation.md`
 - `references/chains-collab.md`
 - `references/chains-content.md`
 - `references/chains-boards.md`
+- `references/chains-commerce.md`
+- `references/chains-services.md`
+- `references/chains-platform.md`
+- `references/chains-sites.md`
+- `references/chains-compliance.md`
 
 ## 7. `batch` Without Shooting Yourself in the Foot
 

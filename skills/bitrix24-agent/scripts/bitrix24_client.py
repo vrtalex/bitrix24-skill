@@ -73,7 +73,9 @@ PACK_METHOD_ALLOWLIST: Dict[str, Tuple[str, ...]] = {
         "im.*",
         "imbot.*",
         "imopenlines.*",
+        "imconnector.*",
         "messageservice.*",
+        "mailservice.*",
         "telephony.*",
     ),
     "automation": (
@@ -97,6 +99,27 @@ PACK_METHOD_ALLOWLIST: Dict[str, Tuple[str, ...]] = {
     "boards": (
         "tasks.api.scrum.*",
         "tasks.scrum.*",
+    ),
+    "commerce": (
+        "sale.*",
+        "catalog.*",
+    ),
+    "services": (
+        "booking.*",
+        "calendar.*",
+        "timeman.*",
+    ),
+    "platform": (
+        "entity.*",
+        "biconnector.*",
+        "ai.*",
+    ),
+    "sites": (
+        "landing.*",
+    ),
+    "compliance": (
+        "userconsent.*",
+        "sign.*",
     ),
 }
 
@@ -787,7 +810,11 @@ def main() -> None:
     parser.add_argument(
         "--packs",
         default=os.getenv("B24_PACKS", ",".join(DEFAULT_PACKS)),
-        help="Comma-separated capability packs: core,comms,automation,collab,content,boards. Use 'none' to disable packs.",
+        help=(
+            "Comma-separated capability packs: "
+            "core,comms,automation,collab,content,boards,commerce,services,platform,sites,compliance. "
+            "Use 'none' to disable packs."
+        ),
     )
     parser.add_argument(
         "--list-packs",

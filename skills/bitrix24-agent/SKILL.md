@@ -32,13 +32,24 @@ Response format limits:
 - architecture decision,
 - event/reliability setup.
 
+Term normalization (product vocabulary):
+
+- "collabs", "workgroups", "projects", "social network groups" -> `collab` (and `boards` for scrum).
+- "Copilot", "CoPilot", "BitrixGPT", "AI prompts" -> `platform` (`ai.*`).
+- "open lines", "contact center connectors", "line connectors" -> `comms` (`imopenlines.*`, `imconnector.*`).
+- "feed", "live feed", "news feed" -> `collab` (`log.*`).
+- "sites", "landing pages", "landing" -> `sites` (`landing.*`).
+- "booking", "calendar", "work time", "time tracking" -> `services` (`booking.*`, `calendar.*`, `timeman.*`).
+- "orders", "payments", "catalog", "products" -> `commerce` (`sale.*`, `catalog.*`).
+- "consents", "consent", "e-signature", "sign" -> `compliance` (`userconsent.*`, `sign.*`).
+
 2. Choose auth quickly:
 - one portal/internal: incoming webhook.
 - app/multi-portal/lifecycle features: OAuth.
 
 3. Select minimal packs:
 - default `core`.
-- add only required packs: `comms`, `automation`, `collab`, `content`, `boards`.
+- add only required packs: `comms`, `automation`, `collab`, `content`, `boards`, `commerce`, `services`, `platform`, `sites`, `compliance`.
 
 4. Execute with guardrails:
 - prefer `scripts/bitrix24_client.py` and `scripts/offline_sync_worker.py`,

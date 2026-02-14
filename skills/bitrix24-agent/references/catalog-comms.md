@@ -14,6 +14,8 @@ Scope: chats, chat-bots, messaging, telephony.
 | `telephony.externalCall.register` | write | https://github.com/bitrix24/b24restdocs/blob/main/api-reference/telephony/telephony-external-call-register.md |
 | `telephony.externalCall.finish` | write | https://github.com/bitrix24/b24restdocs/blob/main/api-reference/telephony/telephony-external-call-finish.md |
 | `messageservice.sender.list` | read | https://github.com/bitrix24/b24restdocs/blob/main/api-reference/messageservice/messageservice-sender-list.md |
+| `imconnector.list` | read | https://github.com/bitrix24/b24restdocs/blob/main/api-reference/imopenlines/imconnector/imconnector-list.md |
+| `mailservice.list` | read | https://github.com/bitrix24/b24restdocs/blob/main/api-reference/mailservice/mailservice-list.md |
 
 Event docs:
 - https://github.com/bitrix24/b24restdocs/blob/main/api-reference/chat-bots/messages/events/on-imbot-message-add.md

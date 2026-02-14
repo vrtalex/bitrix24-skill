@@ -25,12 +25,17 @@ Context budget:
 - `collab`: workgroups, social feed, collaboration layer
 - `content`: disk/files/document flows
 - `boards`: scrum/board flows
+- `commerce`: orders, payments, deliveries, product catalog
+- `services`: booking, calendar, time-management
+- `platform`: ai, entity storage, biconnector data layer
+- `sites`: landing/site/page operations
+- `compliance`: user consents and sign-b2e document tails
 
 ## Runtime usage
 
 - Default pack: `core`
 - Add packs for a call: `--packs core,comms`
-- Set global packs: `B24_PACKS="core,comms"`
+- Set global packs: `B24_PACKS="core,commerce"`
 - Disable packs and use only explicit allowlist: `--packs none --method-allowlist 'user.*'`
 
 ## Design rules for new pack entries

@@ -18,8 +18,8 @@ class Bitrix24ClientTests(unittest.TestCase):
         self.assertEqual(b24.parse_pack_list(""), ["core"])
 
     def test_parse_pack_list_valid_and_unknown(self):
-        packs = b24.parse_pack_list("core,comms,core")
-        self.assertEqual(packs, ["core", "comms"])
+        packs = b24.parse_pack_list("core,comms,commerce,core")
+        self.assertEqual(packs, ["core", "comms", "commerce"])
         with self.assertRaises(ValueError):
             b24.parse_pack_list("unknown-pack")
 

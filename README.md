@@ -45,6 +45,27 @@ Short rule:
 - Event trigger entrypoint: outgoing webhook + your queue.
 - Better agent method accuracy: MCP.
 
+## Bitrix24 setup for external systems (quick admin manual)
+
+Source: https://helpdesk.bitrix24.com/open/25866707/
+
+1. Enable external AI connections in Bitrix24 (admin only):
+- Open account menu -> `Settings` -> `MCP servers`.
+- Turn on `Allow connection of external AIs to Bitrix24`.
+- Save.
+
+2. Connect an external assistant:
+- OAuth path (assistant supports OAuth): create connector/app in assistant UI, set MCP URL `https://mcp.bitrix24.com/mcp/`, choose `OAuth`.
+- Token path (assistant has no OAuth): in Bitrix24 open `Apps` -> `MCP connections` -> `Get connection token`, copy token to assistant connector, use MCP URL `https://mcp.bitrix24.com/mcp/`.
+
+3. Validate access model:
+- Commands run on explicit user request.
+- Actions follow the connected user's Bitrix24 permissions.
+
+4. Disable or revoke when needed:
+- Admin can disable global toggle in `Settings` -> `MCP servers`.
+- Users can revoke specific connections via `Apps` -> `MCP connections` -> `My tokens`.
+
 ## Capability packs (recommended model)
 
 Instead of one giant allowlist, this repo uses packs.
@@ -58,11 +79,32 @@ Each pack is a small method set + short recipes.
 | `collab` | Workgroups/socialnetwork/feed-style collaboration |
 | `content` | Disk/files/document flows |
 | `boards` | Scrum/board methods |
+| `commerce` | Sale/catalog: orders, payments, deliveries, products |
+| `services` | Booking/calendar/timeman operations |
+| `platform` | AI, entity storage, biconnector |
+| `sites` | Landing/site/page management |
+| `compliance` | User consent and sign-b2e document tails |
 
 Pack docs:
 - Index: `skills/bitrix24-agent/references/packs.md`
 - Catalogs: `skills/bitrix24-agent/references/catalog-*.md`
 - Chains: `skills/bitrix24-agent/references/chains-*.md`
+
+### Quick pack selection matrix
+
+| Goal | Pack |
+|---|---|
+| CRM leads/deals/tasks/events | `core` |
+| Chats, bots, messaging, telephony | `comms` |
+| Bizproc/robots/templates | `automation` |
+| Workgroups/feed collaboration | `collab` |
+| Files/disk/doc generation | `content` |
+| Scrum/board actions | `boards` |
+| Orders/payments/products/catalog | `commerce` |
+| Booking/calendar/time tracking | `services` |
+| AI engines/entity/biconnector | `platform` |
+| Landing/site/page management | `sites` |
+| Consent and sign-b2e tails | `compliance` |
 
 ## Token-efficient usage with agents
 
