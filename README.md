@@ -395,6 +395,17 @@ Restart runtime or refresh skill cache.
 - Keep scopes minimal.
 - Use `--allow-unlisted` only as controlled exception.
 
+## Disclaimer
+
+- This is an enthusiast project for builders and power users.
+- Use it at your own risk. You are fully responsible for deployment, access control, and production impact.
+- The skill has guardrails on its side, but unsafe runtime setup can still create serious risk.
+- Example of unsafe setup: internet-exposed agent runtime with broad Bitrix24 permissions in a production portal.
+- Store webhook/OAuth credentials in secure secret storage. Never hardcode them in prompts, code, or public configs.
+- Defend against prompt injection. Treat all external text (chat, email, comments, forms) as untrusted input.
+- Handle personal data carefully: data minimization, access control, logging hygiene, and retention policy are your responsibility.
+- Deploy OpenClaw (or any agent runtime) with secure defaults: network restrictions, least privilege, isolated runtime, and monitored audit logs.
+
 ## Common errors
 
 - `Method not found`: wrong method/path/auth URL format.
