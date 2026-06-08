@@ -176,6 +176,16 @@ curl -X POST \
   "https://{portal}/rest/crm.lead.add"
 ```
 
+### 4.5 Data encoding (named JSON vs positional arrays)
+
+Source: `settings/how-to-call-rest-api/data-encoding.md`, `.../general-principles.md`.
+
+- Most methods accept a JSON body (`Content-Type: application/json`). This is the recommended way to pass nested structures (`filter`, `fields`, `select`) because the structure is preserved without manual encoding.
+- Not every method supports JSON: only `GET` and `POST multipart/form-data` are guaranteed for all methods. The fallback uses PHP-style bracket encoding (`fields[TITLE]=...`, `fields[PHONE][0][VALUE]=...`, `filter[>DATE_CREATE]=...`). The bundled client standardizes on JSON bodies; for a method that rejects JSON, call it directly with bracket/form encoding.
+- Order-sensitive methods (e.g. `task.commentitem.add`, `task.checklistitem.complete`) require strict parameter ordering and cannot be passed by name. Use a positional array with 0-based numeric indices, e.g. `[123, {"POST_MESSAGE":"text"}]`. With the client/CLI, pass `--params` as a JSON array (not an object); the client sends the array verbatim and, in OAuth mode, moves `auth` to the query string so the positional payload stays intact.
+- For batch `cmd` fragments, URL-encode special characters (`&`, `?`, `%`, `[`, `]`, `#`); some cases need double encoding (`%` becomes `%25`).
+- Method-name case: legacy methods are case-insensitive (`landing.site.getList` == `...getlist`), but **v2/v3 namespaces are case-sensitive** — `imbot.v2.Bot.list` works while `imbot.v2.bot.list` returns `ERROR_METHOD_NOT_FOUND`. Use the exact casing from the catalogs; the client sends method names verbatim (it does not lower-case them).
+
 ## 5. Scopes Strategy (Least Privilege)
 
 Build scope list from required methods, not from guesswork.
@@ -345,22 +355,27 @@ On excess:
 
 ### 8.2 Resource/operating limits
 
-Bitrix24 returns timing metadata under `time`.
-For cloud, docs describe a method-level operating budget over a 10-minute window.
-When exceeded, that method can be temporarily blocked.
+Separately from request intensity, each method has a resource budget. If total execution
+time for one method exceeds ~480 seconds within the trailing 10-minute window, that method
+is blocked for the offending app/webhook for 10 minutes (other methods keep working),
+returning HTTP `429` with `OPERATION_TIME_LIMIT`. The block lifts automatically.
 
-Important fields:
-- `time.operating`,
-- `time.operating_reset_at`.
+Important response fields (under `time`):
+- `time.operating` — accumulated execution time of that method, in **seconds**,
+- `time.operating_reset_at` — Unix timestamp when part of the method's budget is released.
+
+Use these to throttle a method as it approaches the 480s/10-min ceiling, rather than only
+reacting to `429`.
 
 ### 8.3 Backoff policy (recommended)
 
-For transient overload (`503`, `QUERY_LIMIT_EXCEEDED`, `5xx`):
-1. exponential backoff with jitter,
-2. bounded retries,
-3. circuit breaker on sustained overload.
+Distinguish the limit classes — they need different handling:
 
-Pseudo-policy:
+- `503 QUERY_LIMIT_EXCEEDED` (intensity) and generic `5xx`: transient → exponential backoff with jitter, bounded retries. The client retries these automatically.
+- `429 OPERATION_TIME_LIMIT` (method resource block, ~10 min): do NOT tight-retry — it only burns attempts. The client treats it as non-retryable in-call; back off ~10 minutes for that method only (use `operating_reset_at`).
+- `503 OVERLOAD_LIMIT` (manual portal block): not retryable at all; requires Bitrix24 support. The client treats it as fatal.
+
+Pseudo-policy for the retryable class:
 - retry delays: `0.5s`, `1s`, `2s`, `4s`, `8s` + random jitter,
 - cap total retries (for example, 5),
 - log each retry with correlation id.
@@ -386,10 +401,12 @@ Recommended behavior:
 | `INVALID_CREDENTIALS` | user lacks permissions | adjust user role or run under correct account |
 | `insufficient_scope` | missing scope | add scope and reinstall/reissue auth |
 | `expired_token` | OAuth token expired | refresh via OAuth token endpoint |
-| `QUERY_LIMIT_EXCEEDED` | request burst too high | backoff, queue, batch optimization |
+| `QUERY_LIMIT_EXCEEDED` | request intensity too high (HTTP 503) | backoff (retryable), queue, batch optimization |
+| `OPERATION_TIME_LIMIT` | method exceeded ~480s/10-min budget (HTTP 429) | back off ~10 min for that method (not retried in-call) |
 | `ERROR_BATCH_LENGTH_EXCEEDED` | oversized batch payload | split batch |
 | `ERROR_BATCH_METHOD_NOT_ALLOWED` | disallowed method in batch | call method directly |
-| `OVERLOAD_LIMIT` | manual overload block | escalate to Bitrix24 support |
+| `OVERLOAD_LIMIT` | manual overload block (HTTP 503) | escalate to Bitrix24 support (fatal, not retried) |
+| `invalid_grant` | dead/expired refresh_token | re-authorize via full OAuth flow (fatal) |
 | `ACCESS_DENIED` | non-commercial plan limits | verify portal plan/subscription |
 | `PAYMENT_REQUIRED` | app/payment status issue | verify subscription and app status |
 

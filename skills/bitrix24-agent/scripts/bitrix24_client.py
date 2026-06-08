@@ -31,7 +31,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple, Union
 
 try:
     import fcntl
@@ -43,11 +43,13 @@ MAX_BACKOFF_MS = 30_000
 
 # Secrets patterns to mask in output
 _SECRETS_PATTERNS = [
-    re.compile(r'"(access_token|refresh_token|auth|webhook_code|client_secret)"\s*:\s*"[^"]*"', re.IGNORECASE),
-    re.compile(r'(access_token|refresh_token|auth)=[^&\s"]+', re.IGNORECASE),
+    re.compile(r'"(access_token|refresh_token|auth|webhook_code|client_secret|application_token)"\s*:\s*"[^"]*"', re.IGNORECASE),
+    re.compile(r'(access_token|refresh_token|auth|application_token)=[^&\s"]+', re.IGNORECASE),
 ]
 
-# Fatal error codes that should not be retried
+# Fatal error codes that should not be retried and must stop retry/worker loops.
+# Includes auth/permission failures, dead OAuth refresh tokens (invalid_grant), and
+# OVERLOAD_LIMIT (a manual portal block that only Bitrix24 support can clear).
 FATAL_ERROR_CODES: Set[str] = frozenset({
     "WRONG_AUTH_TYPE",
     "insufficient_scope",
@@ -58,6 +60,15 @@ FATAL_ERROR_CODES: Set[str] = frozenset({
     "INVALID_REQUEST",
     "ACCESS_DENIED",
     "PAYMENT_REQUIRED",
+    "invalid_grant",
+    "OVERLOAD_LIMIT",
+})
+
+# Limit codes that are transient but must NOT be retried inside a single call():
+# OPERATION_TIME_LIMIT (HTTP 429) blocks one method for ~10 minutes, so in-call retry
+# only burns attempts. Callers (e.g. the offline worker) should back off and resume later.
+NON_RETRYABLE_LIMIT_CODES: Set[str] = frozenset({
+    "OPERATION_TIME_LIMIT",
 })
 
 DEFAULT_METHOD_ALLOWLIST: Tuple[str, ...] = (
@@ -135,13 +146,27 @@ PACK_METHOD_ALLOWLIST: Dict[str, Tuple[str, ...]] = {
         "scope",
         "server.time",
     ),
+    "bots": (
+        "imbot.v2.*",
+        "imbot.*",
+    ),
+    "booking": (
+        "booking.*",
+    ),
+    "mail": (
+        "mail.*",
+    ),
+    "templates": (
+        "tasks.template.*",
+    ),
 }
 
 DEFAULT_PACKS: Tuple[str, ...] = ("core",)
 
 METHOD_NAME_SCHEMA: Dict[str, Any] = {
     "type": "string",
-    "pattern": r"^[a-z0-9_]+(?:\.[a-z0-9_]+)*$",
+    # Mixed case allowed: v2/v3 namespaces are case-sensitive (e.g. imbot.v2.Bot.list).
+    "pattern": r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*$",
     "minLength": 3,
 }
 
@@ -193,6 +218,58 @@ def mask_secrets(text: str) -> str:
     for pattern in _SECRETS_PATTERNS:
         result = pattern.sub(lambda m: m.group(0).split(":")[0] + ':"***"' if ":" in m.group(0) else m.group(0).split("=")[0] + "=***", result)
     return result
+
+
+def _result_rows(response: Dict[str, Any]) -> Tuple[Optional[List[Any]], Optional[Tuple[str, ...]]]:
+    """Locate the row array in a response: top-level list result, or result.items (crm.item.*)."""
+    result = response.get("result")
+    if isinstance(result, list):
+        return result, ("result",)
+    if isinstance(result, dict) and isinstance(result.get("items"), list):
+        return result["items"], ("result", "items")
+    return None, None
+
+
+def _row_id(row: Any) -> Any:
+    if isinstance(row, dict):
+        return row.get("id") or row.get("ID")
+    return row
+
+
+def shape_output(response: Dict[str, Any], mode: str = "full", max_items: int = 0) -> str:
+    """Render a response for the agent. Opt-in token economy; 'full' = unchanged default.
+
+    - full    : pretty JSON (indent=2).
+    - compact : minified JSON (no whitespace).
+    - summary : a digest of list results — {count, ids(<=10), next, total}.
+    max_items>0 truncates the result rows (list or result.items) and adds a _truncated marker.
+    Never mutates the input.
+    """
+    if mode == "summary":
+        rows, _ = _result_rows(response)
+        digest = {
+            "count": len(rows) if rows is not None else None,
+            "ids": [_row_id(r) for r in (rows or [])[:10]],
+            "next": response.get("next"),
+            "total": response.get("total"),
+        }
+        return json.dumps(digest, ensure_ascii=False, separators=(",", ":"))
+
+    payload = response
+    if max_items and max_items > 0:
+        rows, path = _result_rows(response)
+        if rows is not None and len(rows) > max_items:
+            payload = dict(response)
+            payload["_truncated"] = {"shown": max_items, "of": len(rows)}
+            if path == ("result",):
+                payload["result"] = rows[:max_items]
+            else:
+                payload["result"] = dict(response["result"])
+                payload["result"]["items"] = rows[:max_items]
+
+    if mode == "compact":
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def parse_bool_env(name: str, default: bool = False) -> bool:
@@ -411,10 +488,14 @@ def batch_command_method(command: str) -> str:
     return method
 
 
-def classify_method_risk(method: str, params: Optional[Dict[str, Any]] = None) -> str:
+def classify_method_risk(
+    method: str,
+    params: Optional[Union[Dict[str, Any], List[Any]]] = None,
+    risk_map: Optional[Dict[str, str]] = None,
+) -> str:
     method_l = method.lower()
     if method_l == "batch":
-        cmd = (params or {}).get("cmd", {})
+        cmd = params.get("cmd", {}) if isinstance(params, dict) else {}
         if isinstance(cmd, dict):
             batch_risks = [classify_method_risk(batch_command_method(v), None) for v in cmd.values() if isinstance(v, str)]
             if "destructive" in batch_risks:
@@ -423,6 +504,14 @@ def classify_method_risk(method: str, params: Optional[Dict[str, Any]] = None) -
                 return "write"
         return "read"
 
+    # The curated catalog Risk column is the source of truth (the name regex misses verbs
+    # like defer/pause/setOwner/send). Fall back to the heuristic for uncatalogued methods.
+    if risk_map is None:
+        risk_map = load_method_risk_map()
+    mapped = risk_map.get(method_l)
+    if mapped in ("read", "write", "destructive"):
+        return mapped
+
     if DESTRUCTIVE_METHOD_RE.search(method_l):
         return "destructive"
     if WRITE_METHOD_RE.search(method_l):
@@ -430,13 +519,64 @@ def classify_method_risk(method: str, params: Optional[Dict[str, Any]] = None) -
     return "read"
 
 
-def validate_method_and_params(method: str, params: Dict[str, Any]) -> None:
+def validate_method_and_params(method: str, params: Union[Dict[str, Any], List[Any]]) -> None:
     validate_json_schema(method, METHOD_NAME_SCHEMA, path="method")
+    if isinstance(params, list):
+        # Positional params are only valid for order-sensitive methods. batch and
+        # event.offline.get require a named object; reject arrays cleanly here so the
+        # downstream batch-allowlist walk never sees a list.
+        if method.lower() in ("batch", "event.offline.get"):
+            raise ValueError(f"method '{method}' requires a JSON object, not a positional array")
+        return
     validate_json_schema(params, GENERIC_PARAMS_SCHEMA, path="params")
-    if method == "batch":
+    method_l = method.lower()
+    if method_l == "batch":
         validate_json_schema(params, BATCH_PARAMS_SCHEMA, path="params")
-    elif method == "event.offline.get":
+    elif method_l == "event.offline.get":
         validate_json_schema(params, EVENT_OFFLINE_GET_SCHEMA, path="params")
+
+
+def missing_required_params(
+    method: str,
+    params: Union[Dict[str, Any], List[Any]],
+    required_map: Dict[str, List[str]],
+) -> List[str]:
+    """Return required params absent from a named (dict) payload, per the bundled map.
+
+    Returns [] for positional (list) payloads (can't be checked by name) and for methods
+    not in the map (the discovered long tail), avoiding false positives.
+    """
+    if not isinstance(params, dict):
+        return []
+    required = required_map.get(method) or []
+    return [name for name in required if name not in params]
+
+
+def load_method_risk_map() -> Dict[str, str]:
+    """Load the optional, bundled per-method risk map (next to this script).
+
+    Keys are lower-cased method names -> 'read'|'write'|'destructive', derived from the
+    catalog Risk column. Missing/unreadable file -> empty (regex heuristic then applies).
+    """
+    path = pathlib.Path(__file__).resolve().parent / "method_risk.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def load_required_params_map() -> Dict[str, List[str]]:
+    """Load the optional, bundled required-params map (next to this script).
+
+    Missing/unreadable file -> empty map (pre-flight then gracefully no-ops).
+    """
+    path = pathlib.Path(__file__).resolve().parent / "required_params.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def get_audit_file_path(cli_value: Optional[str]) -> Optional[pathlib.Path]:
@@ -453,8 +593,16 @@ def write_audit_row(audit_file: Optional[pathlib.Path], row: Dict[str, Any]) -> 
     if audit_file is None:
         return
     audit_file.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(row, ensure_ascii=True) + "\n"
+    # Hold an exclusive lock around the append so concurrent processes/threads cannot
+    # interleave partial JSONL lines (no-op locking on platforms without fcntl).
     with audit_file.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(row, ensure_ascii=True) + "\n")
+        _lock_handle(fh)
+        try:
+            fh.write(line)
+            fh.flush()
+        finally:
+            _unlock_handle(fh)
 
 
 @dataclass(frozen=True)
@@ -501,8 +649,11 @@ class BitrixAPIError(RuntimeError):
 
     @property
     def retryable(self) -> bool:
-        """Check if error is retryable (transient)."""
+        """Check if error is retryable (transient) within a single call()."""
         if self.code in FATAL_ERROR_CODES:
+            return False
+        if self.code in NON_RETRYABLE_LIMIT_CODES:
+            # Transient but method-blocked for minutes; surface instead of tight-retrying.
             return False
         return self.code in {"QUERY_LIMIT_EXCEEDED"} or self.status >= 500
 
@@ -668,7 +819,7 @@ class IdempotencyStore:
         *,
         tenant: str,
         method: str,
-        params: Dict[str, Any],
+        params: Union[Dict[str, Any], List[Any]],
         explicit_key: Optional[str] = None,
     ) -> str:
         if explicit_key:
@@ -676,17 +827,18 @@ class IdempotencyStore:
             if raw_key:
                 return f"{tenant}|{method}|{raw_key}"
 
-        for candidate in (
-            "idempotency_key",
-            "IDEMPOTENCY_KEY",
-            "origin_id",
-            "ORIGIN_ID",
-            "external_id",
-            "EXTERNAL_ID",
-        ):
-            value = params.get(candidate)
-            if isinstance(value, (str, int)):
-                return f"{tenant}|{method}|{candidate}:{value}"
+        if isinstance(params, dict):
+            for candidate in (
+                "idempotency_key",
+                "IDEMPOTENCY_KEY",
+                "origin_id",
+                "ORIGIN_ID",
+                "external_id",
+                "EXTERNAL_ID",
+            ):
+                value = params.get(candidate)
+                if isinstance(value, (str, int)):
+                    return f"{tenant}|{method}|{candidate}:{value}"
 
         payload = json.dumps(params, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
         digest = hashlib.sha256(f"{tenant}|{method}|{payload}".encode("utf-8")).hexdigest()[:24]
@@ -732,6 +884,11 @@ class IdempotencyStore:
     def done(self, key: str, response: Dict[str, Any]) -> None:
         now = int(time.time())
         expires_at = now + self.ttl_sec
+        # Mask secrets before persisting the cached response at rest (mirrors the DLQ writer).
+        try:
+            masked = json.loads(mask_secrets(json.dumps(response, ensure_ascii=True)))
+        except (TypeError, ValueError):
+            masked = response
 
         def mutate(state: Dict[str, Any]) -> Tuple[Dict[str, Any], None]:
             entries = state.get("entries")
@@ -742,7 +899,7 @@ class IdempotencyStore:
                 "status": "done",
                 "updated_at": now,
                 "expires_at": expires_at,
-                "response": response,
+                "response": masked,
             }
             state["entries"] = entries
             return state, None
@@ -812,19 +969,34 @@ class Bitrix24Client:
     def call(
         self,
         method: str,
-        params: Optional[Dict[str, Any]] = None,
+        params: Optional[Union[Dict[str, Any], List[Any]]] = None,
         *,
         rest_v3: bool = False,
     ) -> Dict[str, Any]:
-        payload = dict(params or {})
-        url = self._build_url(method=method, rest_v3=rest_v3)
+        # Most methods take a named object (dict). Order-sensitive methods such as
+        # task.commentitem.add / task.checklistitem.complete require a positional array
+        # (list) per Bitrix24 docs — those must NOT be passed by name.
+        if params is None:
+            payload: Union[Dict[str, Any], List[Any]] = {}
+        elif isinstance(params, dict):
+            payload = dict(params)
+        elif isinstance(params, list):
+            payload = list(params)
+        else:
+            raise ValueError("params must be a dict (named) or a list (positional)")
+        base_url = self._build_url(method=method, rest_v3=rest_v3)
 
         refreshed = False
         for attempt in range(1, self.max_attempts + 1):
             self.rate_limiter.acquire(self.tenant.domain)
+            url = base_url
             if self.tenant.auth_mode == "oauth":
                 access_token, _ = self.token_store.get_tokens()
-                payload["auth"] = access_token
+                if isinstance(payload, dict):
+                    payload["auth"] = access_token
+                elif access_token:
+                    # Positional payloads cannot carry an 'auth' field; pass it in the query.
+                    url = self._with_auth_query(base_url, access_token)
 
             try:
                 result = self._post_json(url, payload)
@@ -885,7 +1057,14 @@ class Bitrix24Client:
         raise BitrixAPIError("Retries exhausted", code="RETRIES_EXHAUSTED")
 
     def _try_refresh_token(self) -> bool:
-        """Thread-safe token refresh using singleflight pattern."""
+        """Thread-safe token refresh using a singleflight pattern.
+
+        The winner performs the refresh. Losers wait for the winner to finish and
+        then verify the access token actually changed: if the winner's refresh failed
+        (token unchanged), losers must NOT assume success, otherwise every waiting
+        thread would retry with a stale token and the real error would be swallowed.
+        """
+        old_access, _ = self.token_store.get_tokens()
         acquired = self._refresh_lock.acquire(blocking=False)
         if acquired:
             try:
@@ -898,11 +1077,11 @@ class Bitrix24Client:
             finally:
                 self._refresh_lock.release()
         else:
-            # Another thread is refreshing, wait for it
+            # Another thread is refreshing; wait for it, then confirm it succeeded.
             with self._refresh_lock:
-                # Lock acquired means refresh is done, tokens should be updated
                 pass
-            return True
+            new_access, _ = self.token_store.get_tokens()
+            return new_access is not None and new_access != old_access
 
     def iter_list(
         self,
@@ -910,11 +1089,12 @@ class Bitrix24Client:
         params: Optional[Dict[str, Any]] = None,
         *,
         rest_v3: bool = False,
-        page_size: int = 50,
     ) -> Iterator[Dict[str, Any]]:
-        """Iterate over all items from a paginated list method.
+        """Iterate over all items from a paginated *.list method.
 
-        Yields individual items from result list. Automatically handles pagination.
+        Yields individual items, advancing the ``start`` offset by following the
+        ``next`` cursor in each response until it is absent. Bitrix24 list methods
+        page in fixed blocks of 50; there is no client-tunable page size.
         """
         start = 0
         base_params = dict(params or {})
@@ -928,10 +1108,16 @@ class Bitrix24Client:
                 for item in result:
                     yield item
             elif isinstance(result, dict):
-                # Some methods return dict with items
-                for item in result.values():
-                    if isinstance(item, dict):
+                items = result.get("items")
+                if isinstance(items, list):
+                    # Universal methods (crm.item.*) nest rows under result.items.
+                    for item in items:
                         yield item
+                else:
+                    # Legacy dict-of-records result.
+                    for item in result.values():
+                        if isinstance(item, dict):
+                            yield item
 
             # Check for next page
             next_start = response.get("next")
@@ -967,16 +1153,20 @@ class Bitrix24Client:
 
     def _build_url(self, *, method: str, rest_v3: bool) -> str:
         domain = self.tenant.domain.strip().rstrip("/")
-        if not domain.startswith("http://") and not domain.startswith("https://"):
+        scheme = domain.lower()
+        if scheme.startswith("http://"):
+            # Refuse plaintext: webhook codes and OAuth tokens must never travel over HTTP.
+            raise ValueError("Bitrix24 domain must use https:// (plaintext http:// is not allowed)")
+        if not scheme.startswith("https://"):
             domain = f"https://{domain}"
 
         if self.tenant.auth_mode == "webhook":
             if not self.tenant.webhook_user_id or not self.tenant.webhook_code:
                 raise ValueError("webhook_user_id and webhook_code are required for webhook mode")
-            # REST v3 for webhooks uses same path structure as v2
-            # The /rest/api/ prefix is for OAuth mode only per Bitrix24 docs
+            # REST v3 webhooks use the /rest/api/ prefix; v2 uses /rest/.
+            prefix = "rest/api" if rest_v3 else "rest"
             return (
-                f"{domain}/rest/"
+                f"{domain}/{prefix}/"
                 f"{self.tenant.webhook_user_id}/{self.tenant.webhook_code}/{method}"
             )
 
@@ -985,7 +1175,12 @@ class Bitrix24Client:
             return f"{domain}/rest/api/{method}"
         return f"{domain}/rest/{method}"
 
-    def _post_json(self, url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    @staticmethod
+    def _with_auth_query(url: str, token: str) -> str:
+        sep = "&" if "?" in url else "?"
+        return f"{url}{sep}auth={urllib.parse.quote(token, safe='')}"
+
+    def _post_json(self, url: str, payload: Union[Dict[str, Any], List[Any]]) -> Dict[str, Any]:
         req = urllib.request.Request(
             url=url,
             method="POST",
@@ -1155,6 +1350,18 @@ def main() -> None:
         help="Disable secrets masking in output",
     )
     parser.add_argument(
+        "--out",
+        choices=["full", "compact", "summary"],
+        default="full",
+        help="Output shape (default full). compact=minified JSON; summary=list digest. Saves agent tokens.",
+    )
+    parser.add_argument(
+        "--max-items",
+        type=int,
+        default=0,
+        help="Truncate result rows to N (0=no limit); adds a _truncated marker.",
+    )
+    parser.add_argument(
         "--method-allowlist",
         default=os.getenv("B24_METHOD_ALLOWLIST", ""),
         help="Comma-separated method allowlist patterns, e.g. 'user.*,crm.*,batch'",
@@ -1177,6 +1384,11 @@ def main() -> None:
         "--allow-unlisted",
         action="store_true",
         help="Allow methods outside allowlist for this call",
+    )
+    parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="Locally check required params before calling (uses bundled required_params.json)",
     )
     parser.add_argument(
         "--plan-only",
@@ -1254,12 +1466,14 @@ def main() -> None:
         print(f"Error: Invalid JSON in --params: {e}", file=sys.stderr)
         raise SystemExit(1)
 
-    if not isinstance(params, dict):
-        print("Error: --params must decode to a JSON object", file=sys.stderr)
+    if not isinstance(params, (dict, list)):
+        print("Error: --params must decode to a JSON object or array", file=sys.stderr)
         raise SystemExit(1)
 
     tenant, token_store = load_tenant_config_from_env()
-    method = (args.method or "").strip().lower()
+    # Preserve method-name case: v2/v3 namespaces are case-sensitive (e.g. imbot.v2.Bot.list).
+    # Allowlist/risk/validation lower-case internally, so matching is unaffected.
+    method = (args.method or "").strip()
 
     if args.execute_plan:
         plan_store = PlanStore(pathlib.Path(args.plan_file), ttl_sec=args.plan_ttl_sec)
@@ -1269,12 +1483,12 @@ def main() -> None:
             print(f"Error: {exc}", file=sys.stderr)
             raise SystemExit(2)
 
-        planned_method = str(plan.get("method", "")).strip().lower()
+        planned_method = str(plan.get("method", "")).strip()
         planned_params = plan.get("params", {})
-        if not isinstance(planned_params, dict):
+        if not isinstance(planned_params, (dict, list)):
             print("Error: stored plan payload is invalid", file=sys.stderr)
             raise SystemExit(2)
-        if method and method != planned_method:
+        if method and method.lower() != planned_method.lower():
             print(
                 f"Error: CLI method '{method}' does not match planned method '{planned_method}'",
                 file=sys.stderr,
@@ -1328,7 +1542,7 @@ def main() -> None:
         )
         raise SystemExit(2)
 
-    if method == "batch":
+    if method.lower() == "batch":
         batch_cmd = params.get("cmd", {})
         if isinstance(batch_cmd, dict):
             for name, command in batch_cmd.items():
@@ -1344,6 +1558,16 @@ def main() -> None:
                     raise SystemExit(2)
 
     method_risk = classify_method_risk(method, params=params)
+
+    if args.preflight:
+        missing = missing_required_params(method, params, load_required_params_map())
+        if missing:
+            print(
+                f"Error: method '{method}' is missing required params: {', '.join(missing)}. "
+                "Add them, or omit --preflight to bypass.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
 
     if args.plan_only:
         plan_store = PlanStore(pathlib.Path(args.plan_file), ttl_sec=args.plan_ttl_sec)
@@ -1394,6 +1618,8 @@ def main() -> None:
     )
     request_id = uuid.uuid4().hex[:12]
     started = time.time()
+    # Audit records only parameter shape, never values. Positional (list) payloads have no keys.
+    param_keys = sorted(params.keys()) if isinstance(params, dict) else []
     audit_file = None if args.no_audit else get_audit_file_path(args.audit_file)
     idempotency_enabled = method_risk in {"write", "destructive"} and not args.no_idempotency
     idempotency_store = None
@@ -1427,12 +1653,12 @@ def main() -> None:
                     "allowlisted": method_allowed,
                     "packs": selected_packs,
                     "rest_v3": args.rest_v3,
-                    "param_keys": sorted(params.keys()),
+                    "param_keys": param_keys,
                     "plan_id": args.execute_plan or "",
                     "idempotency_key": idempotency_key,
                 },
             )
-            output = json.dumps(cached, ensure_ascii=False, indent=2)
+            output = shape_output(cached, mode=args.out, max_items=args.max_items)
             if args.mask_secrets:
                 output = mask_secrets(output)
             print(output)
@@ -1459,7 +1685,7 @@ def main() -> None:
                 "allowlisted": method_allowed,
                 "packs": selected_packs,
                 "rest_v3": args.rest_v3,
-                "param_keys": sorted(params.keys()),
+                "param_keys": param_keys,
                 "plan_id": args.execute_plan or "",
                 "idempotency_key": idempotency_key,
                 "idempotent_replay": replayed,
@@ -1484,14 +1710,14 @@ def main() -> None:
             "allowlisted": method_allowed,
             "packs": selected_packs,
             "rest_v3": args.rest_v3,
-            "param_keys": sorted(params.keys()),
+            "param_keys": param_keys,
             "plan_id": args.execute_plan or "",
             "idempotency_key": idempotency_key,
             "idempotent_replay": replayed,
         },
     )
 
-    output = json.dumps(response, ensure_ascii=False, indent=2)
+    output = shape_output(response, mode=args.out, max_items=args.max_items)
     if args.mask_secrets:
         output = mask_secrets(output)
     print(output)

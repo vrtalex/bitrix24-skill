@@ -163,5 +163,171 @@ class OfflineWorkerTests(unittest.TestCase):
         self.assertEqual(len(clear_calls), 0)
 
 
+    def test_event_handler_registry_dispatch(self):
+        seen = []
+        worker.register_handler("ONCRMDEALADD", lambda ev: seen.append(ev.get("event")))
+        try:
+            # dispatch routes by event name, case-insensitively
+            worker.dispatch_event({"event": "oncrmdealadd", "data": {}})
+            self.assertEqual(seen, ["oncrmdealadd"])
+            # unregistered event falls back to the no-op default handler (no raise)
+            worker.dispatch_event({"event": "ONSOMETHINGELSE", "data": {}})
+            self.assertEqual(seen, ["oncrmdealadd"])
+        finally:
+            worker.EVENT_HANDLERS.clear()
+
+    def test_redrive_dlq_reprocesses_and_keeps_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dlq = pathlib.Path(tmp) / "dlq.jsonl"
+            worker.write_dlq(dlq, tenant="t", event_item={"event": "ONOK", "message_id": "1", "data": {}}, error="x", retries=1)
+            worker.write_dlq(dlq, tenant="t", event_item={"event": "ONFAIL", "message_id": "2", "data": {}}, error="y", retries=1)
+
+            def boom(ev):
+                raise RuntimeError("still failing")
+
+            worker.register_handler("ONOK", lambda ev: None)
+            worker.register_handler("ONFAIL", boom)
+            try:
+                reprocessed, remaining = worker.redrive_dlq(dlq)
+            finally:
+                worker.EVENT_HANDLERS.clear()
+
+            self.assertEqual((reprocessed, remaining), (1, 1))
+            rows = [json.loads(line) for line in dlq.read_text(encoding="utf-8").splitlines() if line.strip()]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["event"], "ONFAIL")
+
+    def test_bootstrap_offline_binds_with_event_type_offline(self):
+        class Rec:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, method, params=None, **kwargs):
+                self.calls.append((method, params))
+                return {"result": True}
+
+        rec = Rec()
+        worker.bootstrap_offline(rec, "ONCRMLEADADD")
+        self.assertEqual(rec.calls[0], ("event.bind", {"event": "ONCRMLEADADD", "event_type": "offline"}))
+
+    def test_retry_budget_has_pending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rb = worker.RetryBudget(pathlib.Path(tmp) / "s.json", max_retries=3)
+            self.assertFalse(rb.has_pending())
+            rb.fail("k1")
+            self.assertTrue(rb.has_pending())
+            rb.clear("k1")
+            self.assertFalse(rb.has_pending())
+
+    def test_dlq_masks_application_token(self):
+        # A retry-exhausted event is persisted to the DLQ with its full payload, which can
+        # include an auth.application_token. That secret must be masked at rest.
+        response = {
+            "result": {
+                "process_id": "p1",
+                "events": [
+                    {
+                        "message_id": "1",
+                        "event": "E1",
+                        "data": {"v": 1},
+                        "auth": {"application_token": "SEKRETTOKEN"},
+                    }
+                ],
+            }
+        }
+        client = FakeClient(response)
+        with tempfile.TemporaryDirectory() as tmp:
+            dlq = pathlib.Path(tmp) / "dlq.jsonl"
+            rb = worker.RetryBudget(pathlib.Path(tmp) / "s.json", max_retries=1)
+            with mock.patch.object(worker, "process_event_default", side_effect=RuntimeError("boom")):
+                worker.run_once(client, tenant_key="t", retry_budget=rb, dlq_path=dlq)
+            text = dlq.read_text(encoding="utf-8")
+        self.assertNotIn("SEKRETTOKEN", text)
+        self.assertIn("***", text)
+        # The row must still be valid JSON.
+        rows = [json.loads(line) for line in text.splitlines() if line.strip()]
+        self.assertEqual(len(rows), 1)
+
+    def test_single_instance_lock_blocks_second_acquire(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lock = pathlib.Path(tmp) / "worker.lock"
+            handle = worker.acquire_single_instance_lock(lock)
+            try:
+                with self.assertRaises(RuntimeError):
+                    worker.acquire_single_instance_lock(lock)
+            finally:
+                handle.close()
+
+    def test_tenant_lock_path_scopes_by_tenant(self):
+        p = worker.tenant_lock_path(".runtime/offline_worker.lock", "portal.example")
+        self.assertEqual(p.as_posix(), ".runtime/offline_worker_portal.example.lock")
+        # Different tenants must resolve to different lock files so they can run concurrently.
+        p2 = worker.tenant_lock_path(".runtime/offline_worker.lock", "https://other.bitrix24.ru")
+        self.assertNotEqual(p, p2)
+        # Scheme/path separators in the tenant key must be sanitized out of the filename.
+        self.assertNotIn("/", p2.name)
+        self.assertNotIn(":", p2.name)
+
+    def test_parse_args_auto_refresh_flag(self):
+        with mock.patch.object(sys, "argv", ["prog", "--auto-refresh"]):
+            args = worker.parse_args()
+        self.assertTrue(args.auto_refresh)
+        with mock.patch.object(sys, "argv", ["prog"]):
+            args = worker.parse_args()
+        self.assertFalse(args.auto_refresh)
+
+
+from bitrix24_client import NoopRateLimiter, TenantConfig, TokenStore  # noqa: E402
+
+
+class WorkerMainTests(unittest.TestCase):
+    """Cover main() loop, circuit breakers, and graceful shutdown."""
+
+    def _drive_main(self, argv, on_call):
+        tenant = TenantConfig(domain="t.example", auth_mode="webhook", webhook_user_id="1", webhook_code="c")
+
+        class FakeClient:
+            def __init__(self, *a, **k):
+                pass
+
+            def call(self, method, params=None, **k):
+                return on_call(method, params)
+
+        with mock.patch.object(worker, "load_tenant_config_from_env", return_value=(tenant, TokenStore())), \
+                mock.patch.object(worker, "build_rate_limiter_from_env", return_value=NoopRateLimiter()), \
+                mock.patch.object(worker, "Bitrix24Client", FakeClient), \
+                mock.patch.object(worker.time, "sleep", lambda s: None), \
+                mock.patch.object(sys, "argv", ["prog", "--lock-file", "", *argv]):
+            worker.main()
+
+    def test_graceful_shutdown_handler_sets_flag(self):
+        gs = worker.GracefulShutdown()
+        self.assertFalse(gs.should_stop)
+        gs._handle_signal(15, None)
+        self.assertTrue(gs.should_stop)
+
+    def test_main_once_empty_batch_returns_cleanly(self):
+        # Empty offline queue -> run_once returns 0 -> --once returns without SystemExit.
+        self._drive_main(["--once"], lambda m, p: {"result": {"process_id": "", "events": []}})
+
+    def test_main_fatal_error_exits_1(self):
+        def on_call(method, params):
+            raise BitrixAPIError("denied", status=403, code="WRONG_AUTH_TYPE")
+
+        with self.assertRaises(SystemExit) as cm:
+            self._drive_main(["--once"], on_call)
+        self.assertEqual(cm.exception.code, 1)
+
+    def test_main_consecutive_errors_breaker_exits_1(self):
+        # Non-fatal, non-once: the consecutive-error breaker must stop the loop (exit 1),
+        # not spin forever.
+        def on_call(method, params):
+            raise BitrixAPIError("slow", status=503, code="QUERY_LIMIT_EXCEEDED")
+
+        with self.assertRaises(SystemExit) as cm:
+            self._drive_main([], on_call)  # no --once
+        self.assertEqual(cm.exception.code, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

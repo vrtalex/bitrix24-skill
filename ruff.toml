@@ -1,0 +1,11 @@
+# Lint config for CI. Conservative on purpose: catch real errors (pyflakes) and
+# basic style without bikeshedding line length on long URLs / regexes.
+target-version = "py39"
+line-length = 120
+
+[lint]
+select = ["E", "F", "W"]
+ignore = [
+    "E501",  # line length: long doc URLs and regex literals are intentional
+    "E741",  # ambiguous var names (e.g. single-letter loop vars) are acceptable here
+]

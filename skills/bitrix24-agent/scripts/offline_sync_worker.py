@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Offline event worker baseline for Bitrix24.
 
+Requires OAuth application auth (B24_AUTH_MODE=oauth): event.offline.* are denied for
+incoming webhooks (the portal returns WRONG_AUTH_TYPE / HTTP 403). Bind the offline
+handler with event.bind using event_type=offline (no handler URL).
+
 This worker:
 - pulls offline events via event.offline.get(clear=0),
 - retries failed records with bounded budget,
@@ -12,7 +16,6 @@ This worker:
 from __future__ import annotations
 
 import argparse
-import fcntl
 import hashlib
 import json
 import pathlib
@@ -21,14 +24,22 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows has no fcntl; locking degrades to no-op
+    fcntl = None  # type: ignore[assignment]
+
 THIS_DIR = pathlib.Path(__file__).resolve().parent
 if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
-from bitrix24_client import (
+from bitrix24_client import (  # noqa: E402  (import follows sys.path bootstrap above)
     Bitrix24Client,
     BitrixAPIError,
+    build_rate_limiter_from_env,
     load_tenant_config_from_env,
+    mask_secrets,
+    refresh_via_oauth_server,
     secure_compare,
 )
 
@@ -139,8 +150,16 @@ class RetryBudget:
             self._state = {}
             return
         try:
-            self._state = json.loads(self.state_file.read_text(encoding="utf-8"))
-        except Exception:
+            loaded = json.loads(self.state_file.read_text(encoding="utf-8"))
+            self._state = loaded if isinstance(loaded, dict) else {}
+        except Exception as exc:  # noqa: BLE001
+            # A corrupt/partial state file would otherwise silently wipe all retry counts,
+            # defeating the DLQ-after-N-failures guarantee. Surface it loudly.
+            print(
+                f"WARNING: could not read retry state {self.state_file} ({exc}); "
+                "starting with empty retry counts",
+                file=sys.stderr,
+            )
             self._state = {}
 
     def save(self) -> None:
@@ -162,6 +181,40 @@ class RetryBudget:
     def exhausted(self, key: str) -> bool:
         return self._state.get(key, 0) >= self.max_retries
 
+    def has_pending(self) -> bool:
+        """True if any event is mid-retry (kept un-acknowledged for redelivery)."""
+        return bool(self._state)
+
+
+def tenant_lock_path(lock_file: str, tenant_key: str) -> pathlib.Path:
+    """Derive a per-tenant lock file path so different portals never block each other."""
+    base = pathlib.Path(lock_file)
+    safe_tenant = tenant_key.replace("/", "_").replace(":", "_")
+    return base.with_name(f"{base.stem}_{safe_tenant}{base.suffix}")
+
+
+def acquire_single_instance_lock(lock_path: pathlib.Path) -> Any:
+    """Acquire an advisory single-instance lock for the worker.
+
+    Two workers polling the same tenant would fight over offline batches and clobber
+    shared retry/DLQ state. Holding an exclusive, non-blocking flock prevents that.
+    Returns the open file handle (keep it alive for the worker's lifetime). Raises
+    RuntimeError if another instance already holds the lock. Locking is skipped on
+    platforms without fcntl.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("w", encoding="utf-8")
+    if fcntl is not None:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            raise RuntimeError(
+                f"another worker instance already holds {lock_path}; "
+                "run one worker per tenant"
+            )
+    return handle
+
 
 def write_dlq(
     dlq_path: pathlib.Path,
@@ -182,22 +235,87 @@ def write_dlq(
         "payload": event_item,
         "ts": int(time.time()),
     }
-    row_json = json.dumps(row, ensure_ascii=True) + "\n"
+    # Mask secrets (e.g. auth.application_token) before persisting the full payload at rest.
+    row_json = mask_secrets(json.dumps(row, ensure_ascii=True)) + "\n"
 
-    # Open with append mode and use exclusive lock for the write
+    # Open with append mode and use an exclusive lock for the write (no-op without fcntl).
     with dlq_path.open("a", encoding="utf-8") as fh:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        if fcntl is not None:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
         try:
             fh.write(row_json)
             fh.flush()
         finally:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
 def process_event_default(event_item: Dict[str, Any]) -> None:
-    """Replace this with domain-specific processing."""
+    """Default fallback handler: no-op (log-and-ack). Replace or register per-event handlers."""
     _ = event_item
     return
+
+
+# Per-event-name handler registry. Keys are upper-cased event names (e.g. "ONCRMDEALADD").
+# Register a handler to process a specific event; unregistered events use process_event_default.
+#   from offline_sync_worker import register_handler
+#   def on_deal_add(event_item): ...   # event_item["data"] holds the payload
+#   register_handler("ONCRMDEALADD", on_deal_add)
+EVENT_HANDLERS: Dict[str, Any] = {}
+
+
+def register_handler(event_name: str, handler: Any) -> None:
+    """Register a callable(event_item) for a specific Bitrix24 event name (case-insensitive)."""
+    EVENT_HANDLERS[event_name.upper()] = handler
+
+
+def dispatch_event(event_item: Dict[str, Any]) -> None:
+    """Route an event to its registered handler, falling back to process_event_default."""
+    name = str(event_item.get("event") or event_item.get("EVENT") or "").upper()
+    EVENT_HANDLERS.get(name, process_event_default)(event_item)
+
+
+def redrive_dlq(dlq_path: pathlib.Path) -> Tuple[int, int]:
+    """Re-process dead-lettered events through the handler registry.
+
+    Each DLQ row's payload is dispatched again; rows that succeed are removed, rows that
+    still fail are kept. Returns (reprocessed, remaining). File-locked like write_dlq.
+    """
+    if not dlq_path.exists():
+        return (0, 0)
+    reprocessed = 0
+    remaining: List[str] = []
+    with dlq_path.open("r+", encoding="utf-8") as fh:
+        if fcntl is not None:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            for line in fh.read().splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    payload = json.loads(line).get("payload") or {}
+                    dispatch_event(payload)
+                    reprocessed += 1
+                except Exception:  # noqa: BLE001 - keep anything that fails to reprocess
+                    remaining.append(line)
+            fh.seek(0)
+            fh.truncate(0)
+            if remaining:
+                fh.write("\n".join(remaining) + "\n")
+            fh.flush()
+        finally:
+            if fcntl is not None:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    return (reprocessed, len(remaining))
+
+
+def bootstrap_offline(client: Bitrix24Client, event_name: str) -> Dict[str, Any]:
+    """Register an offline handler for event_name (event.bind, event_type=offline).
+
+    Requires OAuth application auth (see module docstring). After binding, the worker
+    drains the queue with event.offline.get(clear=0).
+    """
+    return client.call("event.bind", params={"event": event_name, "event_type": "offline"})
 
 
 def clear_processed(
@@ -284,7 +402,7 @@ def run_once(
         dedup = event_dedup_key(event_item)
         msg_id = event_message_id(event_item)
         try:
-            process_event_default(event_item)
+            dispatch_event(event_item)
             retry_budget.clear(dedup)
             if msg_id:
                 clear_ids.append(msg_id)
@@ -336,18 +454,71 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Expected application_token for event validation (optional)",
     )
+    parser.add_argument(
+        "--auto-refresh",
+        action="store_true",
+        help="Enable OAuth token refresh via oauth.bitrix24.tech (OAuth mode only)",
+    )
+    parser.add_argument(
+        "--lock-file",
+        default=".runtime/offline_worker.lock",
+        help="Single-instance advisory lock file (per tenant). Set empty to disable.",
+    )
+    parser.add_argument(
+        "--redrive",
+        action="store_true",
+        help="Re-process the DLQ through registered handlers, then exit (no portal needed).",
+    )
+    parser.add_argument(
+        "--bind-offline",
+        default="",
+        metavar="EVENT",
+        help="Register an offline handler (event.bind event_type=offline) for EVENT, then exit (OAuth).",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
 
+    # DLQ re-drive is a one-shot that needs no portal/tenant — handle it first.
+    if args.redrive:
+        reprocessed, remaining = redrive_dlq(pathlib.Path(args.dlq_file))
+        print(f"DLQ re-drive: reprocessed={reprocessed}, remaining={remaining}")
+        return
+
     # Setup graceful shutdown handler
     shutdown = GracefulShutdown()
 
     tenant, token_store = load_tenant_config_from_env()
     tenant_key = tenant.domain
-    client = Bitrix24Client(tenant, token_store=token_store)
+
+    # Prevent two workers from racing over the same tenant's offline batches and state.
+    # The lock is always scoped per tenant so different portals can run concurrently.
+    lock_handle = None
+    if args.lock_file:
+        lock_path = tenant_lock_path(args.lock_file, tenant_key)
+        try:
+            lock_handle = acquire_single_instance_lock(lock_path)
+        except RuntimeError as exc:
+            print(f"FATAL: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+    # Share the per-portal rate limiter and (optionally) OAuth refresh with the client so the
+    # polling loop is throttled and can recover expired tokens like the CLI does.
+    refresh_callback = refresh_via_oauth_server if args.auto_refresh else None
+    client = Bitrix24Client(
+        tenant,
+        token_store=token_store,
+        rate_limiter=build_rate_limiter_from_env(),
+        refresh_callback=refresh_callback,
+    )
+    if args.bind_offline:
+        print(bootstrap_offline(client, args.bind_offline))
+        if lock_handle is not None:
+            lock_handle.close()
+        return
+
     retry_budget = RetryBudget(pathlib.Path(args.state_file), max_retries=args.max_retries)
     dlq_path = pathlib.Path(args.dlq_file)
 
@@ -368,7 +539,9 @@ def main() -> None:
             if args.once:
                 print(f"Processed batch size: {count}")
                 return
-            if count == 0:
+            # Sleep when idle OR when events were left un-acknowledged for retry, so a
+            # persistently failing event cannot drive a tight, server-hammering poll loop.
+            if count == 0 or retry_budget.has_pending():
                 time.sleep(args.sleep)
         except BitrixAPIError as exc:
             consecutive_errors += 1
@@ -393,6 +566,8 @@ def main() -> None:
             break
 
     print("Worker stopped gracefully")
+    if lock_handle is not None:
+        lock_handle.close()
 
 
 if __name__ == "__main__":

@@ -11,7 +11,9 @@ Compact, production-oriented skill pack for connecting AI agents to Bitrix24 RES
 
 ## Official docs source
 
+- Universal online docs: https://apidocs.bitrix24.com
 - Main documentation repo: https://github.com/bitrix24/b24restdocs
+- Developer hub (SDKs, tools): https://github.com/bitrix24/bitrix24-dev-hub
 - MCP docs: https://github.com/bitrix24/b24restdocs/blob/main/sdk/mcp.md
 
 ## Project layout
@@ -56,8 +58,11 @@ Additional setup reference: https://helpdesk.bitrix24.com/open/21133100/
 - Save.
 
 2. Connect an external assistant:
-- OAuth path (assistant supports OAuth): create connector/app in assistant UI, set MCP URL `https://mcp.bitrix24.com/mcp/`, choose `OAuth`.
-- Token path (assistant has no OAuth): in Bitrix24 open `Apps` -> `MCP connections` -> `Get connection token`, copy token to assistant connector, use MCP URL `https://mcp.bitrix24.com/mcp/`.
+- The MCP endpoint is region/deployment-specific — read it from your portal's `Settings` -> `MCP servers` page rather than hardcoding a global host (the `https://mcp.bitrix24.com/mcp/` form is the cloud default; .ru/.eu/other regions, data-residency and on-premise differ).
+- OAuth path (assistant supports OAuth): create connector/app in assistant UI, set the MCP URL from your portal, choose `OAuth`.
+- Token path (assistant has no OAuth): in Bitrix24 open `Apps` -> `MCP connections` -> `Get connection token`, copy token to assistant connector, use the MCP URL from your portal.
+
+Use the official MCP for method/field discovery; use this skill's governed CLI for safe transactional writes (allowlist, confirm gates, plan/execute, idempotency, audit).
 
 3. Validate access model:
 - Commands run on explicit user request.
@@ -105,6 +110,10 @@ Each pack is a small method set + short recipes.
 | `sites` | Landing/site/page management |
 | `compliance` | User consent and sign-b2e document tails |
 | `diagnostics` | Method/scope/feature/events compatibility checks |
+| `bots` | Chat-bot construction (imbot.v2: bots, commands, chat messages) |
+| `booking` | Bookings, resources, slots, client types |
+| `mail` | Mailboxes and email messages |
+| `templates` | Recurring task templates (tasks.template) |
 
 Pack docs:
 - Index: `skills/bitrix24-agent/references/packs.md`
@@ -196,12 +205,16 @@ export B24_RATE_LIMITER_BURST="10"
 
 ## Quick start
 
-1. Create env:
+1. Create env (run from the repository root, where `.env.example` lives):
 
 ```bash
 cp .env.example .env
 source .env
 ```
+
+   If you copied only `skills/bitrix24-agent/` into a runtime skills folder, there is no
+   bundled `.env.example` there — set the `B24_*` variables directly (all of them are listed
+   in `skills/bitrix24-agent/SKILL.md` → "Runtime Prerequisites").
 
 2. Fill `.env`.
 
@@ -323,31 +336,40 @@ export B24_SMOKE_WRITE="1"
 python3 -m unittest tests.test_integration_smoke -v
 ```
 
-## OpenClaw / Moltbot
+## Install (any SKILL.md runtime)
 
-Skill path in this repo:
+`SKILL.md` is an open standard, so installing is the same everywhere: copy this repo's skill folder
 
 ```text
 skills/bitrix24-agent
 ```
 
-OpenClaw:
+into the runtime's skills directory (global or per-project):
+
+| Runtime | Skills directory |
+|---|---|
+| Claude Code | `~/.claude/skills/` or project `.claude/skills/` |
+| OpenAI Codex CLI | `~/.codex/skills/` or `.agents/skills/` |
+| Gemini CLI | `~/.gemini/skills/` |
+| Cursor | project `.cursor/skills/` |
+| GitHub Copilot (VS Code) | via the `chatSkills` contribution point |
+| OpenClaw | `~/.openclaw/skills/` |
+| Hermes (Nous Research) | `~/.hermes/skills/` |
+
+Example (Claude Code; swap the path for any runtime above):
 
 ```bash
-mkdir -p ~/.openclaw/skills
-cp -R skills/bitrix24-agent ~/.openclaw/skills/bitrix24-agent
+mkdir -p ~/.claude/skills
+cp -R skills/bitrix24-agent ~/.claude/skills/bitrix24-agent
 ```
 
-Moltbot:
+Hermes also installs from a published URL with no clone: `hermes skills install https://<host>/path/SKILL.md --name bitrix24-agent` (in-session: `/skills install <url> --name bitrix24-agent`); it auto-discovers skills by their `description`, effective in new sessions (`/reset`, or `--now` to refresh the prompt cache).
 
-```bash
-mkdir -p ~/.moltbot/skills
-cp -R skills/bitrix24-agent ~/.moltbot/skills/bitrix24-agent
-```
+After copying, restart the runtime or refresh the skill cache (Claude Code 2.1+ hot-reloads `~/.claude/skills/`; `/reload-skills` forces it).
 
-Restart runtime or refresh skill cache.
+Keep the folder name `bitrix24-agent` — it must match the skill's `name`, or some runtimes silently skip it. Do not add a namespace prefix (`org/bitrix24-agent`).
 
-## User scenarios (20 examples)
+## User scenarios (26 examples)
 
 1. Create a lead from website form payload and attach source metadata.
 2. Enrich a lead with normalized phone/email and external profile signals.
@@ -369,12 +391,12 @@ Restart runtime or refresh skill cache.
 18. Run guarded bulk updates via `batch` for operational cleanup.
 19. Validate method availability/scopes before rollout using diagnostics pack.
 20. Recover missed event handling through offline events polling and replay.
-10. Trigger bizproc workflow from CRM event.
-11. Send notification to chat on task changes.
-12. Register bot command and return structured answer.
-13. Manage workgroup metadata and members flow.
-14. Upload and attach files to process entities.
-15. Run scrum board updates from external triggers.
+21. Trigger bizproc workflow from CRM event.
+22. Send notification to chat on task changes.
+23. Register bot command and return structured answer.
+24. Manage workgroup metadata and members flow.
+25. Upload and attach files to process entities.
+26. Run scrum board updates from external triggers.
 
 ## Reliability and safety
 
@@ -410,6 +432,9 @@ Restart runtime or refresh skill cache.
 
 - `Method not found`: wrong method/path/auth URL format.
 - `WRONG_AUTH_TYPE`: method requires a different auth context.
-- `QUERY_LIMIT_EXCEEDED`: too much request intensity.
+- `QUERY_LIMIT_EXCEEDED`: too much request intensity (HTTP 503); client backs off and retries.
+- `OPERATION_TIME_LIMIT`: one method exceeded its ~480s/10-min budget (HTTP 429); back off ~10 min for that method.
+- `OVERLOAD_LIMIT`: manual portal block (HTTP 503); not retryable, contact Bitrix24 support.
 - `insufficient_scope`: missing scopes/permissions.
 - `expired_token`: refresh OAuth token and retry.
+- `invalid_grant`: refresh_token is dead; re-authorize via the full OAuth flow.

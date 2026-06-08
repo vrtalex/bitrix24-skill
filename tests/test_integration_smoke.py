@@ -39,6 +39,31 @@ class Bitrix24IntegrationSmokeTests(unittest.TestCase):
         self.assertIn("result", response)
         self.assertIsInstance(response["result"], list)
 
+    def test_per_pack_methods_reachable(self):
+        # One representative read per capability pack must be REACHABLE on a live portal:
+        # a result, or any error other than method-not-found (arg errors / app-context-only
+        # still prove the method exists, the allowlist pattern resolves, and the scope is granted).
+        probes = [
+            ("crm.item.list", {"entityTypeId": 1, "select": ["id"]}),       # core
+            ("bizproc.workflow.template.list", {}),                          # automation
+            ("sonet_group.get", {}),                                         # collab
+            ("disk.storage.getlist", {}),                                    # content
+            ("sale.order.list", {}),                                         # commerce
+            ("timeman.status", {}),                                          # services
+            ("ai.engine.list", {}),                                          # platform
+            ("landing.site.getList", {}),                                    # sites
+            ("userconsent.agreement.list", {}),                              # compliance
+            ("server.time", {}),                                            # diagnostics
+            ("imopenlines.config.list.get", {}),                            # comms
+        ]
+        not_found = {"ERROR_METHOD_NOT_FOUND", "METHOD_NOT_FOUND"}
+        for method, params in probes:
+            with self.subTest(method=method):
+                try:
+                    self.client.call(method, params=params)
+                except b24.BitrixAPIError as exc:
+                    self.assertNotIn(exc.code, not_found, f"{method} not found on portal")
+
     @unittest.skipUnless(os.getenv("B24_SMOKE_WRITE") == "1", "Set B24_SMOKE_WRITE=1 to run write smoke flow")
     def test_crm_lead_add_and_update(self):
         marker = f"SKILL_SMOKE_{int(time.time())}"

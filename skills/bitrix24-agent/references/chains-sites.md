@@ -4,7 +4,7 @@
 
 1. `landing.site.add`
 2. `landing.landing.add`
-3. `landing.block.getList`
+3. `landing.block.getlist`
 
 ## 2) Content update flow
 
